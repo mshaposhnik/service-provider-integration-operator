@@ -19,6 +19,10 @@ import (
 	"net/http"
 	"strings"
 
+	"k8s.io/client-go/rest"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/serviceprovider"
 
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/config"
@@ -32,7 +36,7 @@ var _ serviceprovider.ServiceProvider = (*Quay)(nil)
 type Quay struct {
 	Configuration config.Configuration
 	lookup        serviceprovider.GenericLookup
-	httpClient    *http.Client
+	httpClient    rest.HTTPClient
 }
 
 var Initializer = serviceprovider.Initializer{
@@ -109,12 +113,21 @@ func (g *Quay) GetServiceProviderUrlForRepo(repoUrl string) (string, error) {
 	return serviceprovider.GetHostWithScheme(repoUrl)
 }
 
+func (q *Quay) CheckRepositoryAccess(ctx context.Context, cl client.Client, accessCheck *api.SPIAccessCheck) (*api.SPIAccessCheckStatus, error) {
+	log.FromContext(ctx).Info("trying SPIAccessCheck on quay.io. This is not supported yet.")
+	return &api.SPIAccessCheckStatus{
+		Accessibility: api.SPIAccessCheckAccessibilityUnknown,
+		ErrorReason:   api.SPIAccessCheckErrorNotImplemented,
+		ErrorMessage:  "Access check for quay.io is not implemented.",
+	}, nil
+}
+
 type quayProbe struct{}
 
 var _ serviceprovider.Probe = (*quayProbe)(nil)
 
 func (q quayProbe) Examine(_ *http.Client, url string) (string, error) {
-	if strings.HasPrefix(url, "https://quay.io") {
+	if strings.HasPrefix(url, "https://quay.io") || strings.HasPrefix(url, "quay.io") {
 		return "https://quay.io", nil
 	} else {
 		return "", nil
