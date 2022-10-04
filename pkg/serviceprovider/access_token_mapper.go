@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package controllers
+package serviceprovider
 
 import (
+	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -37,8 +39,8 @@ type AccessTokenMapper struct {
 	Scopes                  []string `json:"scopes"`
 }
 
-// toSecretType converts the data in the mapper to a map with fields corresponding to the provided secret type.
-func (at AccessTokenMapper) toSecretType(secretType corev1.SecretType) map[string]string {
+// ToSecretType converts the data in the mapper to a map with fields corresponding to the provided secret type.
+func (at AccessTokenMapper) ToSecretType(secretType corev1.SecretType) map[string]string {
 	ret := map[string]string{}
 	switch secretType {
 	case corev1.SecretTypeBasicAuth:
@@ -49,7 +51,16 @@ func (at AccessTokenMapper) toSecretType(secretType corev1.SecretType) map[strin
 	case corev1.SecretTypeDockercfg:
 		ret[corev1.DockerConfigKey] = at.Token
 	case corev1.SecretTypeDockerConfigJson:
-		ret[corev1.DockerConfigJsonKey] = at.Token
+		// parse host from ServiceProviderUrl if that is not possible use the whole ServiceProviderUrl as host
+		host := at.ServiceProviderUrl
+		parsed, err := url.Parse(at.ServiceProviderUrl)
+		if err == nil && parsed.Host != "" {
+			host = parsed.Host
+		}
+		ret[corev1.DockerConfigJsonKey] = fmt.Sprintf(`{"auths":{"%s":{"username":"%s","password":"%s"}}}`,
+			host,
+			at.ServiceProviderUserName,
+			at.Token)
 	case corev1.SecretTypeSSHAuth:
 		ret[corev1.SSHAuthPrivateKey] = at.Token
 	}
@@ -57,9 +68,9 @@ func (at AccessTokenMapper) toSecretType(secretType corev1.SecretType) map[strin
 	return ret
 }
 
-// fillByMapping sets the data from the mapper into the provided map according to the settings specified in the provided
+// FillByMapping sets the data from the mapper into the provided map according to the settings specified in the provided
 // mapping.
-func (at AccessTokenMapper) fillByMapping(mapping *api.TokenFieldMapping, existingMap map[string]string) {
+func (at AccessTokenMapper) FillByMapping(mapping *api.TokenFieldMapping, existingMap map[string]string) {
 	if mapping.ExpiredAfter != "" && at.ExpiredAfter != nil {
 		existingMap[mapping.ExpiredAfter] = strconv.FormatUint(*at.ExpiredAfter, 10)
 	}

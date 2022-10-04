@@ -15,7 +15,9 @@
 package github
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 
 	api "github.com/redhat-appstudio/service-provider-integration-operator/api/v1beta1"
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/serviceprovider"
@@ -25,14 +27,14 @@ type tokenFilter struct{}
 
 var _ serviceprovider.TokenFilter = (*tokenFilter)(nil)
 
-func (t *tokenFilter) Matches(matchable serviceprovider.Matchable, token *api.SPIAccessToken) (bool, error) {
+func (t *tokenFilter) Matches(_ context.Context, matchable serviceprovider.Matchable, token *api.SPIAccessToken) (bool, error) {
 	if token.Status.TokenMetadata == nil {
 		return false, nil
 	}
 
 	githubState := TokenState{}
 	if err := json.Unmarshal(token.Status.TokenMetadata.ServiceProviderState, &githubState); err != nil {
-		return false, err
+		return false, fmt.Errorf("failed to unmarshal token data: %w", err)
 	}
 
 	for repoUrl, rec := range githubState.AccessibleRepos {

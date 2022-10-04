@@ -42,7 +42,8 @@ type SPIAccessCheckStatus struct {
 type SPIRepoType string
 
 const (
-	SPIRepoTypeGit SPIRepoType = "git"
+	SPIRepoTypeGit               SPIRepoType = "git"
+	SPIRepoTypeContainerRegistry SPIRepoType = "containerRegistry"
 )
 
 type SPIAccessCheckErrorReason string
@@ -53,6 +54,7 @@ const (
 	SPIAccessCheckErrorRepoNotFound           SPIAccessCheckErrorReason = "RepositoryNotFound"
 	SPIAccessCheckErrorBadURL                 SPIAccessCheckErrorReason = "BadURL"
 	SPIAccessCheckErrorNotImplemented         SPIAccessCheckErrorReason = "NotImplemented"
+	SPIAccessCheckErrorTokenLookupFailed      SPIAccessCheckErrorReason = "TokenLookupFailure"
 )
 
 type SPIAccessCheckAccessibility string

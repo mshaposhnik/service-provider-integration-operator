@@ -12,37 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package config
+package controllers
 
 import (
-	"os"
-	"strconv"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func TestEnvConfiguration(t *testing.T) {
-	envBoolTest := func(t *testing.T, varName string, defaultVal bool, funcUnderTest func() bool) {
-		var expected bool
+func TestAggregatedError(t *testing.T) {
+	e := NewAggregatedError(errors.New("a"), errors.New("b"), errors.New("c"))
+	assert.Equal(t, "a, b, c", e.Error())
+}
 
-		origVal, present := os.LookupEnv(varName)
-		if !present {
-			expected = defaultVal
-		} else {
-			var err error
-			expected, err = strconv.ParseBool(origVal)
-			assert.NoError(t, err)
-		}
+func TestAggregatedError_Add(t *testing.T) {
+	e := NewAggregatedError()
 
-		actual := funcUnderTest()
+	assert.Equal(t, "", e.Error())
 
-		assert.NoError(t, os.Setenv(varName, origVal))
+	e.Add(errors.New("a"))
+	assert.Equal(t, "a", e.Error())
 
-		assert.Equal(t, expected, actual)
-	}
+	e.Add(errors.New("b"))
+	assert.Equal(t, "a, b", e.Error())
 
-	t.Run("controllers", func(t *testing.T) {
-		envBoolTest(t, runControllersEnv, runControllersDefault, RunControllers)
-	})
+	e.Add(errors.New("c"))
+	assert.Equal(t, "a, b, c", e.Error())
 }

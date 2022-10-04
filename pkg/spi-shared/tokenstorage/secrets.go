@@ -16,6 +16,7 @@ package tokenstorage
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/sync"
@@ -37,6 +38,10 @@ var _ TokenStorage = (*secretsTokenStorage)(nil)
 // NewSecretsStorage creates a new `TokenStorage` instance using the provided Kubernetes client.
 func NewSecretsStorage(cl client.Client) (TokenStorage, error) {
 	return &secretsTokenStorage{Client: cl, syncer: sync.New(cl)}, nil
+}
+
+func (s secretsTokenStorage) Initialize(_ context.Context) error {
+	return nil
 }
 
 func (s secretsTokenStorage) Store(ctx context.Context, owner *api.SPIAccessToken, token *api.Token) error {
@@ -69,7 +74,7 @@ func (s secretsTokenStorage) Store(ctx context.Context, owner *api.SPIAccessToke
 	if err := s.Create(ctx, secret); err != nil {
 		if errors.IsAlreadyExists(err) {
 			if gerr := s.Client.Get(ctx, client.ObjectKey{Name: owner.Name, Namespace: owner.Namespace}, secret); gerr != nil {
-				return gerr
+				return fmt.Errorf("error trying to get the secret during the store: %w", gerr)
 			}
 
 			secret.Data = data
@@ -88,6 +93,11 @@ func (s secretsTokenStorage) Store(ctx context.Context, owner *api.SPIAccessToke
 			}
 
 			err = s.Update(ctx, secret)
+			if err != nil {
+				err = fmt.Errorf("error trying to udpate the secret during the store: %w", err)
+			}
+		} else {
+			err = fmt.Errorf("error trying to create the secret during the store: %w", err)
 		}
 
 		if err != nil {
@@ -112,7 +122,7 @@ func (s secretsTokenStorage) Get(ctx context.Context, owner *api.SPIAccessToken)
 	if exp, ok := secret.Data["expiry"]; ok {
 		expiry, err = strconv.ParseUint(string(exp), 10, 64)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error trying to parse expiry during get: %w", err)
 		}
 	}
 
@@ -134,7 +144,12 @@ func (s secretsTokenStorage) Delete(ctx context.Context, owner *api.SPIAccessTok
 		return nil
 	}
 
-	return s.Client.Delete(ctx, secret)
+	err = s.Client.Delete(ctx, secret)
+	if err != nil {
+		err = fmt.Errorf("error trying to delete the secret: %w", err)
+	}
+
+	return err
 }
 
 func (s secretsTokenStorage) getBackingSecret(ctx context.Context, owner *api.SPIAccessToken) (*corev1.Secret, error) {
@@ -144,7 +159,7 @@ func (s secretsTokenStorage) getBackingSecret(ctx context.Context, owner *api.SP
 		if errors.IsNotFound(err) {
 			return nil, nil
 		}
-		return nil, err
+		return nil, fmt.Errorf("error trying to get the secret: %w", err)
 	}
 
 	return secret, nil

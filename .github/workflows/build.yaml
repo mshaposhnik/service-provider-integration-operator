@@ -27,7 +27,7 @@ jobs:
   build-imgs:
     runs-on: ubuntu-20.04
     steps:
-      - name: Checkout devworkspace-operator source code
+      - name: Checkout service-provider-integration-operator source code
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
@@ -39,7 +39,7 @@ jobs:
             quay.io/redhat-appstudio/service-provider-integration-operator
           tags: |
             type=semver,pattern={{version}}
-            type=sha
+            type=sha,format=long
             type=raw,value=next,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
@@ -64,3 +64,5 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

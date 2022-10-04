@@ -17,8 +17,14 @@ package quay
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
-	"net/url"
+	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	api "github.com/redhat-appstudio/service-provider-integration-operator/api/v1beta1"
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/serviceprovider"
@@ -26,50 +32,40 @@ import (
 )
 
 type metadataProvider struct {
-	httpClient   *http.Client
-	tokenStorage tokenstorage.TokenStorage
+	tokenStorage     tokenstorage.TokenStorage
+	httpClient       *http.Client
+	kubernetesClient client.Client
+	ttl              time.Duration
 }
 
 var _ serviceprovider.MetadataProvider = (*metadataProvider)(nil)
-var quayUserApiEndpoint *url.URL
+var invalidRepoUrl = errors.New("invalid repository URL")
 
-func init() {
-	qUrl, err := url.Parse("https://quay.io/api/v1/user")
-	if err != nil {
-		panic(err)
-	}
-	quayUserApiEndpoint = qUrl
-}
+func (p metadataProvider) Fetch(ctx context.Context, token *api.SPIAccessToken) (*api.TokenMetadata, error) {
+	lg := log.FromContext(ctx, "tokenName", token.Name, "tokenNamespace", token.Namespace)
 
-func (s metadataProvider) Fetch(ctx context.Context, token *api.SPIAccessToken) (*api.TokenMetadata, error) {
-	data, err := s.tokenStorage.Get(ctx, token)
+	data, err := p.tokenStorage.Get(ctx, token)
 	if err != nil {
-		return nil, err
+		lg.Error(err, "failed to get the token metadata")
+		return nil, fmt.Errorf("failed to get the token metadata: %w", err)
 	}
 
 	if data == nil {
-		return nil, err
+		return nil, nil
 	}
+
+	// This method is called when we need to refresh (or obtain anew, after cache expiry) the metadata of the token.
+	// Because we load all the state iteratively for Quay, this info is always empty when fresh.
 
 	state := &TokenState{
-		AccessibleRepos: map[RepositoryUrl]RepositoryRecord{},
+		Repositories:  map[string]EntityRecord{},
+		Organizations: map[string]EntityRecord{},
 	}
-	//TODO: verify access
-	var username string
-	if len(data.Username) > 0 {
-		username = data.Username
-	} else {
-		username, err = s.fetchUser(data.AccessToken)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	state.RemoteUsername = username
 
 	js, err := json.Marshal(state)
 	if err != nil {
-		return nil, err
+		lg.Error(err, "failed to serialize the token metadata, this should not happen")
+		return nil, fmt.Errorf("failed to marshal the state to JSON: %w", err)
 	}
 
 	metadata := token.Status.TokenMetadata
@@ -80,53 +76,201 @@ func (s metadataProvider) Fetch(ctx context.Context, token *api.SPIAccessToken) 
 
 	if len(data.Username) > 0 {
 		metadata.Username = data.Username
-		// TODO: replace with real repo access verification
-		metadata.Scopes = []string{"repo:read", "repo:write"}
 	} else {
-		metadata.Username = "$oauthtoken"
-		metadata.Scopes = serviceprovider.GetAllScopes(translateToQuayScopes, &token.Spec.Permissions)
+		metadata.Username = OAuthTokenUserName
 	}
 
 	metadata.ServiceProviderState = js
 
+	lg.Info("token metadata initialized")
+
 	return metadata, nil
 }
 
-func (s metadataProvider) fetchUser(accessToken string) (userName string, err error) {
-	var res *http.Response
-	res, err = s.httpClient.Do(&http.Request{
-		Method: "GET",
-		URL:    quayUserApiEndpoint,
-		Header: map[string][]string{
-			"Authorization": {"Bearer " + accessToken},
-		},
-	})
+// RepositoryMetadata is the return value of the FetchRepo method. It represents the scopes that are granted for some
+// token on a given repository and organization it belongs to.
+type RepositoryMetadata struct {
+	Repository   EntityRecord
+	Organization EntityRecord
+}
+
+// FetchRepo is the iterative version of Fetch used internally in the Quay service provider. It takes care of both
+// fetching and caching of the data on per-repository basis.
+func (p metadataProvider) FetchRepo(ctx context.Context, repoUrl string, token *api.SPIAccessToken) (metadata RepositoryMetadata, err error) {
+	lg := log.FromContext(ctx, "repo", repoUrl, "tokenName", token.Name, "tokenNamespace", token.Namespace)
+
+	lg.Info("fetching repository metadata")
+
+	if token.Status.TokenMetadata == nil {
+		lg.Info("no metadata on the token object, bailing")
+		return
+	}
+
+	quayState := TokenState{}
+	if err = json.Unmarshal(token.Status.TokenMetadata.ServiceProviderState, &quayState); err != nil {
+		lg.Error(err, "failed to unmarshal quay token state")
+		err = fmt.Errorf("failed to unmarshal the token state: %w", err)
+		return
+	}
+	if quayState.Repositories == nil || quayState.Organizations == nil {
+		lg.Info("Detected quay token state with empty Repositories or Organizations")
+		if quayState.Repositories == nil {
+			quayState.Repositories = make(map[string]EntityRecord)
+		}
+
+		if quayState.Organizations == nil {
+			quayState.Organizations = make(map[string]EntityRecord)
+		}
+	}
+
+	var tokenData *api.Token
+
+	tokenData, err = p.tokenStorage.Get(ctx, token)
 	if err != nil {
+		lg.Error(err, "failed to get token data")
+		err = fmt.Errorf("failed to get the token data from storage: %w", err)
+		return
+	}
+	if tokenData == nil {
+		lg.Info("no token data found")
 		return
 	}
 
-	content := map[string]interface{}{}
-	if err = json.NewDecoder(res.Body).Decode(&content); err != nil {
+	orgOrUser, repo, _ := splitToOrganizationAndRepositoryAndVersion(repoUrl)
+	if orgOrUser == "" || repo == "" {
+		lg.Error(err, "failed to parse the repository URL")
+		err = fmt.Errorf("%w %s", invalidRepoUrl, repoUrl)
 		return
 	}
 
-	userName = content["username"].(string)
+	// enable the lazy one-time login to docker in the subsequent calls
+	var loginToken *LoginTokenInfo
+	getLoginTokenInfo := func() (LoginTokenInfo, error) {
+		if loginToken != nil {
+			return *loginToken, nil
+		}
+
+		username, password := getUsernameAndPasswordFromTokenData(tokenData)
+		var tkn string
+		tkn, err = DockerLogin(log.IntoContext(ctx, lg), p.httpClient, orgOrUser+"/"+repo, username, password)
+		if err != nil {
+			lg.Error(err, "failed to perform docker login")
+			return LoginTokenInfo{}, fmt.Errorf("fetch failed due to docker login error: %w", err)
+		}
+
+		// empty token means the credentials are no longer valid, which is not an error in and of itself
+		if tkn == "" {
+			return LoginTokenInfo{}, nil
+		}
+
+		info, err := AnalyzeLoginToken(tkn)
+		if err != nil {
+			lg.Error(err, "failed to analyze the docker login token")
+			return LoginTokenInfo{}, fmt.Errorf("failed to analyze the docker login token: %w", err)
+		}
+
+		lg.Info("used docker login to detect rw perms successfully", "repo:read",
+			info.Repositories[repo].Pullable, "repo:write", info.Repositories[repo].Pushable)
+
+		loginToken = &info
+
+		return info, nil
+	}
+
+	var orgChanged, repoChanged bool
+	var orgRecord, repoRecord EntityRecord
+
+	orgRecord, orgChanged, err = p.getEntityRecord(log.IntoContext(ctx, lg.WithValues("entityType", "organization")), tokenData, orgOrUser, quayState.Organizations, getLoginTokenInfo, fetchOrganizationRecord)
+	if err != nil {
+		lg.Error(err, "failed to read the organization metadata")
+		err = fmt.Errorf("failed to read organization metadata: %w", err)
+		return
+	}
+
+	repoRecord, repoChanged, err = p.getEntityRecord(log.IntoContext(ctx, lg.WithValues("entityType", "repository")), tokenData, orgOrUser+"/"+repo, quayState.Repositories, getLoginTokenInfo, fetchRepositoryRecord)
+	if err != nil {
+		lg.Error(err, "failed to read the repository metadata")
+		err = fmt.Errorf("failed to read repository metadata: %w", err)
+		return
+	}
+
+	if orgChanged || repoChanged {
+		if err = p.persistTokenState(ctx, token, &quayState); err != nil {
+			lg.Error(err, "failed to persist the metadata changes")
+			return
+		}
+	}
+
+	return RepositoryMetadata{
+		Repository:   repoRecord,
+		Organization: orgRecord,
+	}, nil
+}
+
+// helper types for getEntityRecord parameters
+type loginInfoFn func() (LoginTokenInfo, error)
+type fetchEntityRecordFn func(ctx context.Context, cl *http.Client, repoUrl string, tokenData *api.Token, info LoginTokenInfo) (*EntityRecord, error)
+
+// getEntityRecord is a method for getting the different types of repository scopes in a uniform fashion. If needed,
+// it updates the provided cache with the new data and uses the loginInfoFn to fetch the docker login info and fetchFn
+// for actually fetching the EntityRecord (only when needed - i.e. if the data for given key is not in the cache or
+// is expired).
+func (p metadataProvider) getEntityRecord(ctx context.Context, tokenData *api.Token, key string, cache map[string]EntityRecord, loginInfoFn loginInfoFn, fetchFn fetchEntityRecordFn) (rec EntityRecord, changed bool, err error) {
+	rec, present := cache[key]
+
+	lg := log.FromContext(ctx)
+
+	if !present || time.Now().After(time.Unix(rec.LastRefreshTime, 0).Add(p.ttl)) {
+		lg.Info("entity metadata stale, reloading")
+
+		var repoRec *EntityRecord
+
+		var loginInfo LoginTokenInfo
+		loginInfo, err = loginInfoFn()
+		if err != nil {
+			lg.Error(err, "failed to get the docker login info")
+			return
+		}
+
+		repoRec, err = fetchFn(ctx, p.httpClient, key, tokenData, loginInfo)
+		if err != nil {
+			lg.Error(err, "failed to fetch the metadata entity")
+			return
+		}
+
+		if repoRec == nil {
+			repoRec = &EntityRecord{}
+		}
+
+		repoRec.LastRefreshTime = time.Now().Unix()
+
+		cache[key] = *repoRec
+		rec = *repoRec
+		changed = true
+		lg.Info("metadata entity fetched successfully")
+	} else {
+		lg.Info("requested metadata entity still valid")
+	}
 
 	return
 }
 
-func translateToQuayScopes(permission api.Permission) []string {
-	switch permission.Area {
-	case api.PermissionAreaRepository:
-		switch permission.Type {
-		case api.PermissionTypeRead:
-			return []string{"repo:read", "user:read"}
-		case api.PermissionTypeWrite:
-			return []string{"repo:write", "user:read"}
-		case api.PermissionTypeReadWrite:
-			return []string{"repo:read", "repo:write", "user:read"}
-		}
+// persistTokenState persists the provided tokenState in the token object's status and saves it to the cluster.
+func (p metadataProvider) persistTokenState(ctx context.Context, token *api.SPIAccessToken, tokenState *TokenState) error {
+	lg := log.FromContext(ctx)
+
+	data, err := json.Marshal(tokenState)
+	if err != nil {
+		lg.Error(err, "failed to serialize the metadata")
+		err = fmt.Errorf("failed to serialize the metadata: %w", err)
+		return err
 	}
 
-	return []string{}
+	token.Status.TokenMetadata.ServiceProviderState = data
+
+	if err = p.kubernetesClient.Status().Update(ctx, token); err != nil {
+		return fmt.Errorf("failed to persist the token metadata: %w", err)
+	}
+
+	return nil
 }

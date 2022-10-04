@@ -16,8 +16,12 @@ package serviceprovider
 
 import (
 	"context"
+	"fmt"
 	"net/url"
+	"strings"
 	"sync"
+
+	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/logs"
 
 	"k8s.io/apimachinery/pkg/util/errors"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -40,26 +44,49 @@ type GenericLookup struct {
 	MetadataProvider MetadataProvider
 	// MetadataCache is an abstraction used for storing/fetching the metadata of tokens
 	MetadataCache *MetadataCache
+	// RepoHostParser is a function that extracts the host from the repoUrl
+	RepoHostParser RepoHostParser
+}
+
+type RepoHostParser func(url string) (string, error)
+
+func RepoHostFromSchemelessUrl(repoUrl string) (string, error) {
+	schemeIndex := strings.Index(repoUrl, "://")
+	if schemeIndex == -1 {
+		repoUrl = "https://" + repoUrl
+	}
+	return RepoHostFromUrl(repoUrl)
+}
+
+func RepoHostFromUrl(repoUrl string) (string, error) {
+	parsed, err := url.Parse(repoUrl)
+	if err != nil {
+		return "", fmt.Errorf("invalid url: %w", err)
+	}
+
+	return parsed.Host, nil
 }
 
 func (l GenericLookup) Lookup(ctx context.Context, cl client.Client, matchable Matchable) ([]api.SPIAccessToken, error) {
+	lg := log.FromContext(ctx)
+
 	var result = make([]api.SPIAccessToken, 0)
 
 	potentialMatches := &api.SPIAccessTokenList{}
 
-	repoUrl, err := url.Parse(matchable.RepoUrl())
+	repoHost, err := l.RepoHostParser(matchable.RepoUrl())
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("error parsing the host from repo URL %s: %w", matchable.RepoUrl(), err)
 	}
 
 	if err := cl.List(ctx, potentialMatches, client.InNamespace(matchable.ObjNamespace()), client.MatchingLabels{
 		api.ServiceProviderTypeLabel: string(l.ServiceProviderType),
-		api.ServiceProviderHostLabel: repoUrl.Host,
+		api.ServiceProviderHostLabel: repoHost,
 	}); err != nil {
-		return result, err
+		return result, fmt.Errorf("failed to list the potentially matching tokens: %w", err)
 	}
 
-	lg := log.FromContext(ctx)
+	lg.V(logs.DebugLevel).Info("lookup", "potential_matches", len(potentialMatches.Items))
 
 	errs := make([]error, 0)
 
@@ -67,10 +94,13 @@ func (l GenericLookup) Lookup(ctx context.Context, cl client.Client, matchable M
 	wg := sync.WaitGroup{}
 	for _, t := range potentialMatches.Items {
 		if t.Status.Phase != api.SPIAccessTokenPhaseReady {
+			lg.V(logs.DebugLevel).Info("skipping lookup, token not ready", "token", t.Name)
 			continue
 		}
+
 		wg.Add(1)
 		go func(tkn api.SPIAccessToken) {
+			lg.V(logs.DebugLevel).Info("matching", "token", tkn.Name)
 			defer wg.Done()
 			if err := l.MetadataCache.Ensure(ctx, &tkn, l.MetadataProvider); err != nil {
 				mutex.Lock()
@@ -80,7 +110,7 @@ func (l GenericLookup) Lookup(ctx context.Context, cl client.Client, matchable M
 				return
 			}
 
-			ok, err := l.TokenFilter.Matches(matchable, &tkn)
+			ok, err := l.TokenFilter.Matches(ctx, matchable, &tkn)
 			if err != nil {
 				mutex.Lock()
 				defer mutex.Unlock()
@@ -99,8 +129,10 @@ func (l GenericLookup) Lookup(ctx context.Context, cl client.Client, matchable M
 	wg.Wait()
 
 	if len(errs) > 0 {
-		return nil, errors.NewAggregate(errs)
+		return nil, fmt.Errorf("errors while examining the potential matches: %w", errors.NewAggregate(errs))
 	}
+
+	lg.V(logs.DebugLevel).Info("lookup finished", "matching_tokens", len(result))
 
 	return result, nil
 }

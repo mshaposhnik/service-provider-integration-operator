@@ -16,37 +16,20 @@ package github
 
 import (
 	"context"
+	"fmt"
+	"time"
 
+	"github.com/google/go-github/v45/github"
 	sperrors "github.com/redhat-appstudio/service-provider-integration-operator/pkg/errors"
-	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/httptransport"
-
-	"github.com/machinebox/graphql"
-)
-
-const (
-	allAccessibleReposQuery = `
-		query($after: String) {
-			viewer {
-				repositories(first: 100, after: $after, affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER], ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]) {
-					pageInfo {
-						hasNextPage
-						endCursor
-					}
-					nodes {
-						viewerPermission
-						url
-					}
-				}
-			}
-		}`
+	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/logs"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // AllAccessibleRepos lists all the repositories accessible by the current user
 type AllAccessibleRepos struct {
 	Viewer struct {
 		Repositories struct {
-			PageInfo PageInfo `json:"pageInfo"`
-			Nodes    []struct {
+			Nodes []struct {
 				ViewerPermission string `json:"viewerPermission"`
 				Url              string `json:"url"`
 			} `json:"nodes"`
@@ -54,51 +37,43 @@ type AllAccessibleRepos struct {
 	} `json:"viewer"`
 }
 
-func (r *AllAccessibleRepos) FetchAll(ctx context.Context, client *graphql.Client, accessToken string, state *TokenState) error {
+func (r *AllAccessibleRepos) FetchAll(ctx context.Context, githubClient *github.Client, accessToken string, state *TokenState) error {
+
+	lg := log.FromContext(ctx)
+	defer logs.TimeTrack(lg, time.Now(), "fetch all github repositories")
 	if accessToken == "" {
-		return sperrors.InvalidAccessToken
-	}
-
-	ctx = httptransport.WithBearerToken(ctx, accessToken)
-
-	req := graphql.NewRequest(allAccessibleReposQuery)
-
-	err := _fetchAll(ctx, client, req, r, func() PageInfo {
-		return r.Viewer.Repositories.PageInfo
-	}, func() {
-		for _, node := range r.Viewer.Repositories.Nodes {
-			state.AccessibleRepos[RepositoryUrl(node.Url)] = RepositoryRecord{ViewerPermission: ViewerPermission(node.ViewerPermission)}
+		return sperrors.ServiceProviderHttpError{
+			StatusCode: 401,
+			Response:   "the access token is empty, service provider not contacted at all",
 		}
-	})
-
-	if err != nil {
-		return err
 	}
-
-	return nil
-}
-
-// PageInfo should be reused in all the queries that need to be paged
-type PageInfo struct {
-	HasNextPage bool   `json:"hasNextPage"`
-	EndCursor   string `json:"endCursor"`
-}
-
-func _fetchAll(ctx context.Context, client *graphql.Client, req *graphql.Request, self interface{}, pageInfoFromSelf func() PageInfo, processSelf func()) error {
-	req.Var("after", nil)
+	lg.V(logs.DebugLevel).Info("Fetching metadata request")
+	// list all repositories for the authenticated user
+	opt := &github.RepositoryListOptions{}
+	opt.ListOptions.PerPage = 100
 	for {
-		if err := client.Run(ctx, req, self); err != nil {
-			return err
+		repos, resp, err := githubClient.Repositories.List(ctx, "", opt)
+		if err != nil {
+			lg.Error(err, "Error during fetching Github repositories list")
+			return fmt.Errorf("failed to list github repositories: %w", err)
 		}
 
-		processSelf()
+		lg.V(logs.DebugLevel).Info("Received a list of available repositories from Github", "len", len(repos), "nextPage", resp.NextPage, "lastPage", resp.LastPage, "rate", resp.Rate)
+		for _, k := range repos {
+			if k.Permissions["admin"] {
+				state.AccessibleRepos[RepositoryUrl(*k.HTMLURL)] = RepositoryRecord{ViewerPermission: ViewerPermissionAdmin}
+			} else if k.Permissions["push"] {
+				state.AccessibleRepos[RepositoryUrl(*k.HTMLURL)] = RepositoryRecord{ViewerPermission: ViewerPermissionWrite}
+			} else if k.Permissions["pull"] {
+				state.AccessibleRepos[RepositoryUrl(*k.HTMLURL)] = RepositoryRecord{ViewerPermission: ViewerPermissionRead}
+			}
 
-		page := pageInfoFromSelf()
-
-		if !page.HasNextPage {
-			return nil
 		}
-
-		req.Var("after", page.EndCursor)
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.ListOptions.Page = resp.NextPage
 	}
+	lg.V(logs.DebugLevel).Info("Fetching metadata complete", "len", len(state.AccessibleRepos))
+	return nil
 }
