@@ -18,10 +18,13 @@ package controllers
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"time"
 
-	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/infrastructure"
+	"github.com/go-playground/validator/v10"
+
+	"github.com/go-logr/logr"
 
 	opconfig "github.com/redhat-appstudio/service-provider-integration-operator/pkg/config"
 
@@ -51,10 +54,8 @@ type SPIAccessCheckReconciler struct {
 //+kubebuilder:rbac:groups=appstudio.redhat.com,resources=spiaccesschecks/finalizers,verbs=update
 
 func (r *SPIAccessCheckReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	ctx = infrastructure.InitKcpControllerContext(ctx, req)
-
 	lg := log.FromContext(ctx)
-	defer logs.TimeTrack(lg, time.Now(), "Reconcile SPIAccessCheck")
+	defer logs.TimeTrackWithLazyLogger(func() logr.Logger { return lg }, time.Now(), "Reconcile SPIAccessCheck")
 
 	ac := api.SPIAccessCheck{}
 	if err := r.Get(ctx, req.NamespacedName, &ac); err != nil {
@@ -75,9 +76,9 @@ func (r *SPIAccessCheckReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
-	if sp, spErr := r.ServiceProviderFactory.FromRepoUrl(ctx, ac.Spec.RepoUrl); spErr == nil {
+	if sp, spErr := r.ServiceProviderFactory.FromRepoUrl(ctx, ac.Spec.RepoUrl, req.Namespace); spErr == nil {
 		auditLog := log.FromContext(ctx, "audit", "true", "namespace", ac.Namespace, "token", ac.Name, "repository", ac.Spec.RepoUrl)
-		auditLog.Info("performing repository access check")
+		auditLog.Info("performing repository access check", "action", "UPDATE")
 		if status, repoCheckErr := sp.CheckRepositoryAccess(ctx, r.Client, &ac); repoCheckErr == nil {
 			ac.Status = *status
 			auditLog.Info("repository access check succeeded")
@@ -86,9 +87,16 @@ func (r *SPIAccessCheckReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			return ctrl.Result{}, fmt.Errorf("failed to check repository access: %w", repoCheckErr)
 		}
 	} else {
-		lg.Error(spErr, "failed to determine service provider for SPIAccessCheck")
-		ac.Status.ErrorReason = api.SPIAccessCheckErrorUnknownServiceProvider
-		ac.Status.ErrorMessage = spErr.Error()
+		var validationErr validator.ValidationErrors
+		if stderrors.As(spErr, &validationErr) {
+			lg.Error(spErr, "failed to validate service provider for SPIAccessCheck")
+			ac.Status.ErrorReason = api.SPIAccessCheckErrorUnsupportedServiceProviderConfiguration
+			ac.Status.ErrorMessage = spErr.Error()
+		} else {
+			lg.Error(spErr, "failed to determine service provider for SPIAccessCheck")
+			ac.Status.ErrorReason = api.SPIAccessCheckErrorUnknownServiceProvider
+			ac.Status.ErrorMessage = spErr.Error()
+		}
 	}
 
 	if updateErr := r.Client.Status().Update(ctx, &ac); updateErr != nil {

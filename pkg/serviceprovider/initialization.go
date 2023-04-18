@@ -14,7 +14,13 @@
 
 package serviceprovider
 
-import "net/http"
+import (
+	"errors"
+	"fmt"
+	"net/http"
+
+	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/config"
+)
 
 // Probe is a simple function that can determine whether a URL can be handled by a certain service
 // provider.
@@ -31,18 +37,17 @@ type ProbeFunc func(*http.Client, string) (string, error)
 // the base URL of the service provider.
 type Constructor interface {
 	// Construct creates a new instance of service provider
-	Construct(factory *Factory, baseUrl string) (ServiceProvider, error)
+	Construct(factory *Factory, spConfig *config.ServiceProviderConfiguration) (ServiceProvider, error)
 }
 
 // ConstructorFunc converts a compatible function into the Constructor interface
-type ConstructorFunc func(factory *Factory, baseUrl string) (ServiceProvider, error)
+type ConstructorFunc func(factory *Factory, spConfig *config.ServiceProviderConfiguration) (ServiceProvider, error)
 
 // Initializer is struct that contains all necessary data to initialize a service provider instance from a URL using
 // a Factory.
 type Initializer struct {
-	Probe                        Probe
-	Constructor                  Constructor
-	SupportsManualUploadOnlyMode bool
+	Probe       Probe
+	Constructor Constructor
 }
 
 // implementation guards
@@ -53,6 +58,37 @@ func (p ProbeFunc) Examine(cl *http.Client, url string) (string, error) {
 	return p(cl, url)
 }
 
-func (c ConstructorFunc) Construct(factory *Factory, baseUrl string) (ServiceProvider, error) {
-	return c(factory, baseUrl)
+func (c ConstructorFunc) Construct(factory *Factory, spConfig *config.ServiceProviderConfiguration) (ServiceProvider, error) {
+	return c(factory, spConfig)
+}
+
+type Initializers struct {
+	initializers map[config.ServiceProviderName]Initializer
+}
+
+func NewInitializers() *Initializers {
+	return &Initializers{
+		initializers: make(map[config.ServiceProviderName]Initializer),
+	}
+}
+
+var errUnknownServiceProvider = errors.New("initializer not found")
+
+// GetInitializer returns initializer for given service provider type or error in case there is no initializer for such service provider.
+// Initializers are listed in 'knownInitializers' map. Test 'TestAllServiceProvidersHaveInitializer' at 'known_test.go' verifies
+// that all supported service providers has initializer.
+//
+// NOTE: This is pulled out of the serviceprovider package to avoid a circular dependency between it and
+// the implementation packages.
+func (i *Initializers) GetInitializer(spType config.ServiceProviderType) (*Initializer, error) {
+	if initializer, ok := i.initializers[spType.Name]; ok {
+		return &initializer, nil
+	} else {
+		return nil, fmt.Errorf("service provider '%s': %w", spType.Name, errUnknownServiceProvider)
+	}
+}
+
+func (i *Initializers) AddKnownInitializer(serviceprovider config.ServiceProviderType, initializer Initializer) *Initializers {
+	i.initializers[serviceprovider.Name] = initializer
+	return i
 }

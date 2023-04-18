@@ -7,7 +7,7 @@ metadata:
   name: vault
   namespace: spi-vault
   labels:
-    helm.sh/chart: vault-0.20.1
+    helm.sh/chart: vault-0.22.0
     app.kubernetes.io/name: vault
     app.kubernetes.io/instance: vault
     app.kubernetes.io/managed-by: Helm
@@ -19,7 +19,7 @@ metadata:
   name: vault-config
   namespace: spi-vault
   labels:
-    helm.sh/chart: vault-0.20.1
+    helm.sh/chart: vault-0.22.0
     app.kubernetes.io/name: vault
     app.kubernetes.io/instance: vault
     app.kubernetes.io/managed-by: Helm
@@ -43,7 +43,7 @@ kind: ClusterRoleBinding
 metadata:
   name: vault-server-binding
   labels:
-    helm.sh/chart: vault-0.20.1
+    helm.sh/chart: vault-0.22.0
     app.kubernetes.io/name: vault
     app.kubernetes.io/instance: vault
     app.kubernetes.io/managed-by: Helm
@@ -64,10 +64,11 @@ metadata:
   name: vault-internal
   namespace: spi-vault
   labels:
-    helm.sh/chart: vault-0.20.1
+    helm.sh/chart: vault-0.22.0
     app.kubernetes.io/name: vault
     app.kubernetes.io/instance: vault
     app.kubernetes.io/managed-by: Helm
+    vault-internal: "true"
   annotations:
 
 spec:
@@ -93,7 +94,7 @@ metadata:
   name: vault
   namespace: spi-vault
   labels:
-    helm.sh/chart: vault-0.20.1
+    helm.sh/chart: vault-0.22.0
     app.kubernetes.io/name: vault
     app.kubernetes.io/instance: vault
     app.kubernetes.io/managed-by: Helm
@@ -140,7 +141,7 @@ spec:
   template:
     metadata:
       labels:
-        helm.sh/chart: vault-0.20.1
+        helm.sh/chart: vault-0.22.0
         app.kubernetes.io/name: vault
         app.kubernetes.io/instance: vault
         component: server
@@ -181,6 +182,10 @@ spec:
           secret:
             optional: true
             secretName: spi-vault-keys
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+          name: tmp
         - name: home
           emptyDir: {}
       containers:
@@ -193,7 +198,7 @@ spec:
               cpu: 50m
               memory: 100Mi
   
-          image: docker.io/hashicorp/vault:1.10.3
+          image: docker.io/hashicorp/vault:1.11.3
           imagePullPolicy: IfNotPresent
           command:
           - "/bin/sh"
@@ -211,6 +216,13 @@ spec:
    
           securityContext:
             allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
           env:
             - name: HOST_IP
               valueFrom:
@@ -265,6 +277,8 @@ spec:
               name: poststart
             - mountPath: /vault/userconfig/keys
               name: keys
+            - mountPath: /tmp
+              name: tmp
             - name: home
               mountPath: /home/vault
           ports:
@@ -327,7 +341,7 @@ metadata:
   name: vault
   namespace: spi-vault
   labels:
-    helm.sh/chart: vault-0.20.1
+    helm.sh/chart: vault-0.22.0
     app.kubernetes.io/name: vault
     app.kubernetes.io/instance: vault
     app.kubernetes.io/managed-by: Helm
@@ -360,7 +374,7 @@ spec:
   
   containers:
     - name: vault-server-test
-      image: docker.io/hashicorp/vault:1.10.3
+      image: docker.io/hashicorp/vault:1.11.3
       imagePullPolicy: IfNotPresent
       env:
         - name: VAULT_ADDR
@@ -391,6 +405,8 @@ spec:
           name: poststart
         - mountPath: /vault/userconfig/keys
           name: keys
+        - mountPath: /tmp
+          name: tmp
   volumes:
     - configMap:
         defaultMode: 356
@@ -400,4 +416,8 @@ spec:
       secret:
         optional: true
         secretName: spi-vault-keys
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 64Mi
+      name: tmp
   restartPolicy: Never

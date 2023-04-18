@@ -20,15 +20,14 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"net/url"
 	"time"
 
-	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/config"
+	"github.com/go-playground/validator/v10"
 
-	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/infrastructure"
-
-	"github.com/kcp-dev/logicalcluster/v2"
-
+	"github.com/go-logr/logr"
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/logs"
+	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/config"
 
 	sperrors "github.com/redhat-appstudio/service-provider-integration-operator/pkg/errors"
 
@@ -54,11 +53,13 @@ import (
 )
 
 const linkedBindingsFinalizerName = "spi.appstudio.redhat.com/linked-bindings"
-const tokenStorageFinalizerName = "spi.appstudio.redhat.com/token-storage" //nolint:gosec // this is false positive, we're not storing any sensitive data using this
+const tokenStorageFinalizerName = "spi.appstudio.redhat.com/token-storage" //#nosec G101 -- false positive, we're not storing any sensitive data using this
+const tokenRefreshLabelName = "spi.appstudio.redhat.com/refresh-token"     //#nosec G101 -- false positive, just label name, no sensitive data
 
 var (
 	unexpectedObjectTypeError = stderrors.New("unexpected object type")
 	linkedBindingPresentError = stderrors.New("linked bindings present")
+	noCredentialsFoundError   = stderrors.New("no oauth configuration found matching service provider URL of the token")
 )
 
 // SPIAccessTokenReconciler reconciles a SPIAccessToken object
@@ -87,13 +88,14 @@ func (r *SPIAccessTokenReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	err := ctrl.NewControllerManagedBy(mgr).
 		For(&api.SPIAccessToken{}).
+		// We're watching the bindings so that we can remove abandoned tokens without data
 		Watches(&source.Kind{Type: &api.SPIAccessTokenBinding{}}, handler.EnqueueRequestsFromMapFunc(func(object client.Object) []reconcile.Request {
-			return requestsForTokenInObjectNamespace(object, func() string {
+			return requestsForTokenInObjectNamespace(object, "SPIAccessTokenBinding", func() string {
 				return object.GetLabels()[SPIAccessTokenLinkLabel]
 			})
 		})).
 		Watches(&source.Kind{Type: &api.SPIAccessTokenDataUpdate{}}, handler.EnqueueRequestsFromMapFunc(func(object client.Object) []reconcile.Request {
-			return requestsForTokenInObjectNamespace(object, func() string {
+			return requestsForTokenInObjectNamespace(object, "SPIAccessTokenDataUpdate", func() string {
 				update, ok := object.(*api.SPIAccessTokenDataUpdate)
 				if !ok {
 					return ""
@@ -111,30 +113,32 @@ func (r *SPIAccessTokenReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return err
 }
 
-func requestsForTokenInObjectNamespace(object client.Object, tokenNameExtractor func() string) []reconcile.Request {
+func requestsForTokenInObjectNamespace(object client.Object, objectKind string, tokenNameExtractor func() string) []reconcile.Request {
 	tokenName := tokenNameExtractor()
 	if tokenName == "" {
 		return []reconcile.Request{}
 	}
 
-	return []reconcile.Request{
+	reqs := []reconcile.Request{
 		{
-			ClusterName: logicalcluster.From(object).String(),
 			NamespacedName: types.NamespacedName{
 				Namespace: object.GetNamespace(),
 				Name:      tokenName,
 			},
 		},
 	}
+
+	logReconciliationRequests(reqs, "SPIAccessToken", object, objectKind)
+
+	return reqs
 }
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 func (r *SPIAccessTokenReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	ctx = infrastructure.InitKcpControllerContext(ctx, req)
-
 	lg := log.FromContext(ctx)
-	defer logs.TimeTrack(lg, time.Now(), "Reconcile SPIAccessToken")
+	lg.V(logs.DebugLevel).Info("starting reconciliation")
+	defer logs.TimeTrackWithLazyLogger(func() logr.Logger { return lg }, time.Now(), "Reconcile SPIAccessToken")
 
 	at := api.SPIAccessToken{}
 
@@ -192,10 +196,21 @@ func (r *SPIAccessTokenReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
+	if errCheckData := r.reconcileTokenData(ctx, &at); errCheckData != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to check the token's data in token storage: %w", errCheckData)
+	}
+
 	// persist the SP-specific state so that it is available as soon as the token flips to the ready state.
-	sp, err := r.ServiceProviderFactory.FromRepoUrl(ctx, at.Spec.ServiceProviderUrl)
+	sp, err := r.ServiceProviderFactory.FromRepoUrl(ctx, at.Spec.ServiceProviderUrl, req.Namespace)
 	if err != nil {
-		if uerr := r.flipToExceptionalPhase(ctx, &at, api.SPIAccessTokenPhaseError, api.SPIAccessTokenErrorReasonUnknownServiceProvider, err); uerr != nil {
+		var reason api.SPIAccessTokenErrorReason
+		var validationErr validator.ValidationErrors
+		if stderrors.As(err, &validationErr) {
+			reason = api.SPIAccessTokenErrorUnsupportedServiceProviderConfiguration
+		} else {
+			reason = api.SPIAccessTokenErrorReasonUnknownServiceProvider
+		}
+		if uerr := r.flipToExceptionalPhase(ctx, &at, api.SPIAccessTokenPhaseError, reason, err); uerr != nil {
 			return ctrl.Result{}, fmt.Errorf("failed update the status: %w", uerr)
 		}
 		// we flipped the token to the invalid phase, which is valid phase to be in. All we can do is to wait for the
@@ -209,7 +224,7 @@ func (r *SPIAccessTokenReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, fmt.Errorf("failed to validate the object: %w", err)
 	}
 	if len(validation.ScopeValidation) > 0 {
-		if uerr := r.flipToExceptionalPhase(ctx, &at, api.SPIAccessTokenPhaseError, api.SPIAccessTokenErrorReasonUnsupportedPermissions, NewAggregatedError(validation.ScopeValidation...)); uerr != nil {
+		if uerr := r.flipToExceptionalPhase(ctx, &at, api.SPIAccessTokenPhaseInvalid, api.SPIAccessTokenErrorReasonUnsupportedPermissions, NewAggregatedError(validation.ScopeValidation...)); uerr != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update the status: %w", uerr)
 		}
 		return ctrl.Result{}, nil
@@ -233,7 +248,7 @@ func (r *SPIAccessTokenReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
-	if at.EnsureLabels(sp.GetType()) {
+	if ensureLabels(&at, sp.GetType().Name) {
 		if err := r.Update(ctx, &at); err != nil {
 			lg.Error(err, "failed to update the object with the changes")
 			return ctrl.Result{}, fmt.Errorf("failed to update the object with the changes: %w", err)
@@ -243,10 +258,36 @@ func (r *SPIAccessTokenReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.updateTokenStatusSuccess(ctx, &at); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to update the status: %w", err)
 	}
-	lg.WithValues("phase_at_reconcile_end", at.Status.Phase).
-		V(logs.DebugLevel).Info("reconciliation finished successfully")
+
+	lg.V(logs.DebugLevel).Info("looking for label to initiate token refresh...")
+	if val, ok := at.ObjectMeta.Labels[tokenRefreshLabelName]; ok && val == "true" { // intentional string
+		if err := r.refreshToken(ctx, &at, sp); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to refresh the token: %w", err)
+		}
+		delete(at.ObjectMeta.Labels, tokenRefreshLabelName)
+		if err := r.Update(ctx, &at); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to remove token refresh request label: %w", err)
+		}
+	}
+
+	// this will get picked up by the time tracker
+	lg = lg.WithValues("phase_at_reconcile_end", at.Status.Phase)
 
 	return ctrl.Result{RequeueAfter: r.durationUntilNextReconcile(&at)}, nil
+}
+
+// reconcileTokenData verifies that token data are really in the storage. If data is missing, it cleans up the token's metadata
+func (r *SPIAccessTokenReconciler) reconcileTokenData(ctx context.Context, at *api.SPIAccessToken) error {
+	// as an optimization, we check status here first to not touch tokenstorage in cases when we don't expect data to be there
+	if at.Status.TokenMetadata != nil && at.Status.Phase == api.SPIAccessTokenPhaseReady {
+		if token, errGetToken := r.TokenStorage.Get(ctx, at); token == nil && errGetToken == nil {
+			log.FromContext(ctx).Info("no token data found in tokenstorage for the SPIAccessToken. Clearing metadata.")
+			at.Status.TokenMetadata = nil
+		} else if errGetToken != nil {
+			return fmt.Errorf("failed to get the token: %w", errGetToken)
+		}
+	}
+	return nil
 }
 
 func (r *SPIAccessTokenReconciler) durationUntilNextReconcile(at *api.SPIAccessToken) time.Duration {
@@ -296,41 +337,38 @@ func (r *SPIAccessTokenReconciler) fillInStatus(ctx context.Context, at *api.SPI
 		}
 	}
 
-	at.Status.UploadUrl = r.createUploadUrl(ctx, at)
+	at.Status.UploadUrl = fmt.Sprintf("%s/token/%s/%s", r.Configuration.BaseUrl, at.Namespace, at.Name)
 
 	return nil
 }
 
-func (r *SPIAccessTokenReconciler) createUploadUrl(ctx context.Context, at *api.SPIAccessToken) string {
-	if kcpWorkspaceName, hasKcpWorkspace := logicalcluster.ClusterFromContext(ctx); hasKcpWorkspace {
-		return fmt.Sprintf("%s/token/%s/%s/%s", r.Configuration.BaseUrl, kcpWorkspaceName.String(), at.Namespace, at.Name)
-	} else {
-		return fmt.Sprintf("%s/token/%s/%s", r.Configuration.BaseUrl, at.Namespace, at.Name)
-	}
-}
-
 // oAuthUrlFor determines the OAuth flow initiation URL for given token.
 func (r *SPIAccessTokenReconciler) oAuthUrlFor(ctx context.Context, at *api.SPIAccessToken) (string, error) {
-	sp, err := r.ServiceProviderFactory.FromRepoUrl(ctx, at.Spec.ServiceProviderUrl)
+	sp, err := r.ServiceProviderFactory.FromRepoUrl(ctx, at.Spec.ServiceProviderUrl, at.Namespace)
 	if err != nil {
-		return "", fmt.Errorf("failed to determine the service provider from URL %s: %w", at.Spec.ServiceProviderUrl, err)
+		var validationErr validator.ValidationErrors
+		if stderrors.As(err, &validationErr) {
+			return "", fmt.Errorf("failed to validate the service provider for URL %s: %w", at.Spec.ServiceProviderUrl, validationErr)
+		} else {
+			return "", fmt.Errorf("failed to determine the service provider from URL %s: %w", at.Spec.ServiceProviderUrl, err)
+		}
 	}
-	oauthBaseUrl := sp.GetOAuthEndpoint()
-	if len(oauthBaseUrl) == 0 {
+	oauthCapability := sp.GetOAuthCapability()
+	if oauthCapability == nil {
+		log.FromContext(ctx).V(logs.DebugLevel).Info("service provider does not support oauth capability", "serviceprovider", sp.GetType())
 		return "", nil
 	}
 
-	kcpWorkspace := ""
-	if kcpWorkspaceName, hasKcpWorkspace := logicalcluster.ClusterFromContext(ctx); hasKcpWorkspace {
-		kcpWorkspace = kcpWorkspaceName.String()
+	oauthBaseUrl := oauthCapability.GetOAuthEndpoint()
+	if len(oauthBaseUrl) == 0 {
+		return "", nil
 	}
 
 	state, err := oauthstate.Encode(&oauthstate.OAuthInfo{
 		TokenName:           at.Name,
 		TokenNamespace:      at.Namespace,
-		TokenKcpWorkspace:   kcpWorkspace,
-		Scopes:              sp.OAuthScopesFor(&at.Spec.Permissions),
-		ServiceProviderType: config.ServiceProviderType(sp.GetType()),
+		Scopes:              oauthCapability.OAuthScopesFor(&at.Spec.Permissions),
+		ServiceProviderName: sp.GetType().Name,
 		ServiceProviderUrl:  sp.GetBaseUrl(),
 	})
 	if err != nil {
@@ -338,6 +376,48 @@ func (r *SPIAccessTokenReconciler) oAuthUrlFor(ctx context.Context, at *api.SPIA
 	}
 
 	return oauthBaseUrl + "?state=" + state, nil
+}
+
+func (r *SPIAccessTokenReconciler) refreshToken(ctx context.Context, at *api.SPIAccessToken, sp serviceprovider.ServiceProvider) error {
+	lg := logs.AuditLog(ctx)
+	lg.Info("initiated token refresh", "action", "UPDATE")
+	token, err := r.TokenStorage.Get(ctx, at)
+	if err != nil {
+		return fmt.Errorf("unable to get refresh token from storage: %w", err)
+	}
+
+	parsedUrl, err := url.Parse(at.Spec.ServiceProviderUrl)
+	if err != nil {
+		return fmt.Errorf("failed to parse service provider url from token: %w", err)
+	}
+
+	spConfig, err := config.SpConfigFromUserSecret(ctx, r.Client, at.Namespace, sp.GetType(), parsedUrl)
+	if err != nil {
+		return fmt.Errorf("failed to find service provider configuration in user secrets: %w", err)
+	}
+	if spConfig == nil {
+		spConfig = config.SpConfigFromGlobalConfig(&r.Configuration.SharedConfiguration, sp.GetType(), at.Spec.ServiceProviderUrl)
+	}
+	if spConfig == nil || spConfig.OAuth2Config == nil {
+		return noCredentialsFoundError
+	}
+
+	refreshCapability := sp.GetRefreshTokenCapability()
+	if refreshCapability == nil {
+		return fmt.Errorf("%s service provider type: %w", sp.GetType().Name, serviceprovider.RefreshTokenNotSupportedError{})
+	}
+
+	refreshedToken, err := refreshCapability.RefreshToken(ctx, token, spConfig.OAuth2Config)
+	if err != nil {
+		return fmt.Errorf("unable to refresh token: %w", err)
+	}
+
+	if err := r.TokenStorage.Store(ctx, at, refreshedToken); err != nil {
+		return fmt.Errorf("unable to store refresh token: %w", err)
+	}
+
+	lg.Info("token refreshed successfully")
+	return nil
 }
 
 type linkedBindingsFinalizer struct {
@@ -387,4 +467,30 @@ func hasLinkedBindings(ctx context.Context, token *api.SPIAccessToken, k8sClient
 	}
 
 	return len(list.Items) > 0, nil
+}
+
+// EnsureLabels makes sure that the object has labels set according to its spec. The labels are used for faster lookup during
+// token matching with bindings. Returns `true` if the labels were changed, `false` otherwise.
+func ensureLabels(t *api.SPIAccessToken, detectedSp config.ServiceProviderName) (changed bool) {
+	if t.Labels == nil {
+		t.Labels = map[string]string{}
+	}
+
+	if t.Labels[api.ServiceProviderTypeLabel] != string(detectedSp) {
+		t.Labels[api.ServiceProviderTypeLabel] = string(detectedSp)
+		changed = true
+	}
+
+	if len(t.Spec.ServiceProviderUrl) > 0 {
+		// we can't use the full service provider URL as a label value, because K8s doesn't allow :// in label values.
+		spUrl, err := url.Parse(t.Spec.ServiceProviderUrl)
+		if err == nil {
+			if t.Labels[api.ServiceProviderHostLabel] != spUrl.Host {
+				t.Labels[api.ServiceProviderHostLabel] = spUrl.Host
+				changed = true
+			}
+		}
+	}
+
+	return
 }

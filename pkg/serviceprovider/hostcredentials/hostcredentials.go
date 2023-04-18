@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	opconfig "github.com/redhat-appstudio/service-provider-integration-operator/pkg/config"
+	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/config"
 
 	api "github.com/redhat-appstudio/service-provider-integration-operator/api/v1beta1"
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/serviceprovider"
@@ -44,9 +45,9 @@ var Initializer = serviceprovider.Initializer{
 	Constructor: serviceprovider.ConstructorFunc(newHostCredentialsProvider),
 }
 
-func newHostCredentialsProvider(factory *serviceprovider.Factory, repoUrl string) (serviceprovider.ServiceProvider, error) {
+func newHostCredentialsProvider(factory *serviceprovider.Factory, spConfig *config.ServiceProviderConfiguration) (serviceprovider.ServiceProvider, error) {
 
-	cache := serviceprovider.NewMetadataCache(factory.KubernetesClient, &serviceprovider.NeverMetadataExpirationPolicy{})
+	cache := factory.NewCacheWithExpirationPolicy(&serviceprovider.NeverMetadataExpirationPolicy{})
 	return &HostCredentialsProvider{
 		Configuration: factory.Configuration,
 		lookup: serviceprovider.GenericLookup{
@@ -59,43 +60,30 @@ func newHostCredentialsProvider(factory *serviceprovider.Factory, repoUrl string
 			},
 		},
 		httpClient: factory.HttpClient,
-		repoUrl:    repoUrl,
+		repoUrl:    spConfig.ServiceProviderBaseUrl,
 	}, nil
 }
 
 var _ serviceprovider.ConstructorFunc = newHostCredentialsProvider
 
-func (g *HostCredentialsProvider) GetOAuthEndpoint() string {
-	return ""
-}
-
 func (g *HostCredentialsProvider) GetBaseUrl() string {
-	base, err := serviceprovider.GetHostWithScheme(g.repoUrl)
+	base, err := config.GetHostWithScheme(g.repoUrl)
 	if err != nil {
 		return ""
 	}
 	return base
 }
 
-func (g *HostCredentialsProvider) GetType() api.ServiceProviderType {
-	return api.ServiceProviderTypeHostCredentials
+func (g *HostCredentialsProvider) GetType() config.ServiceProviderType {
+	return config.ServiceProviderTypeHostCredentials
 }
 
-func (g *HostCredentialsProvider) OAuthScopesFor(_ *api.Permissions) []string {
-	return []string{}
-}
-
-func (g *HostCredentialsProvider) LookupToken(ctx context.Context, cl client.Client, binding *api.SPIAccessTokenBinding) (*api.SPIAccessToken, error) {
+func (g *HostCredentialsProvider) LookupTokens(ctx context.Context, cl client.Client, binding *api.SPIAccessTokenBinding) ([]api.SPIAccessToken, error) {
 	tokens, err := g.lookup.Lookup(ctx, cl, binding)
 	if err != nil {
 		return nil, fmt.Errorf("token lookup failed: %w", err)
 	}
-
-	if len(tokens) == 0 {
-		return nil, nil
-	}
-
-	return &tokens[0], nil
+	return tokens, nil
 }
 
 func (g *HostCredentialsProvider) PersistMetadata(ctx context.Context, _ client.Client, token *api.SPIAccessToken) error {
@@ -106,12 +94,16 @@ func (g *HostCredentialsProvider) PersistMetadata(ctx context.Context, _ client.
 	return nil
 }
 
-func (g *HostCredentialsProvider) GetServiceProviderUrlForRepo(repoUrl string) (string, error) {
-	host, err := serviceprovider.GetHostWithScheme(repoUrl)
-	if err != nil {
-		return "", fmt.Errorf("detecting host failed: %w", err)
-	}
-	return host, nil
+func (g *HostCredentialsProvider) GetDownloadFileCapability() serviceprovider.DownloadFileCapability {
+	return nil
+}
+
+func (p *HostCredentialsProvider) GetOAuthCapability() serviceprovider.OAuthCapability {
+	return nil
+}
+
+func (g *HostCredentialsProvider) GetRefreshTokenCapability() serviceprovider.RefreshTokenCapability {
+	return nil
 }
 
 func (g *HostCredentialsProvider) CheckRepositoryAccess(ctx context.Context, _ client.Client, accessCheck *api.SPIAccessCheck) (*api.SPIAccessCheckStatus, error) {

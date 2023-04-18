@@ -34,12 +34,15 @@ BUNDLE_DEFAULT_CHANNEL := --default-channel=$(DEFAULT_CHANNEL)
 endif
 BUNDLE_METADATA_OPTS ?= $(BUNDLE_CHANNELS) $(BUNDLE_DEFAULT_CHANNEL)
 
+SPI_IMG_BASE ?= quay.io/redhat-appstudio
+
 # SPIO_IMAGE_TAG_BASE defines the docker.io namespace and part of the image name for remote images.
 # This variable is used to construct full image tags for bundle and catalog images.
 #
 # For example, running 'make bundle-build bundle-push catalog-build catalog-push' will build and push both
 # appstudio.redhat.org/service-provider-integration-operator-bundle:$VERSION and appstudio.redhat.org/service-provider-integration-operator-catalog:$VERSION.
-SPIO_IMAGE_TAG_BASE ?= quay.io/redhat-appstudio/service-provider-integration-operator
+SPIO_IMAGE_NAME ?= service-provider-integration-operator
+SPIO_IMAGE_TAG_BASE ?= $(SPI_IMG_BASE)/$(SPIO_IMAGE_NAME)
 
 # SPIO_BUNDLE_IMG defines the image:tag used for the bundle.
 # You can use it as an arg. (E.g make bundle-build SPIO_BUNDLE_IMG=<some-registry>/<project-name-bundle>:<tag>)
@@ -49,13 +52,17 @@ SPIO_BUNDLE_IMG ?= $(SPIO_IMAGE_TAG_BASE)-bundle:$(TAG_NAME)
 SPIO_IMG ?= $(SPIO_IMAGE_TAG_BASE):$(TAG_NAME)
 
 # SPIS_IMAGE_TAG_BASE defines the docker.io namespace and part of the image name for the OAuth service image.
-SPIS_IMAGE_TAG_BASE ?= quay.io/redhat-appstudio/service-provider-integration-oauth
+SPIS_IMAGE_NAME ?= service-provider-integration-oauth
+SPIS_IMAGE_TAG_BASE ?= $(SPI_IMG_BASE)/$(SPIS_IMAGE_NAME)
 
 # Image URL to use for deploying of the OAuth service
 SPIS_IMG ?= $(SPIS_IMAGE_TAG_BASE):$(TAG_NAME)
 
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = latest
+
+# this variable is used to enable the `make itest focus=...` syntax for running subset of integration test suite.
+focus ?= ""
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -93,18 +100,19 @@ all: build
 # http://linuxcommand.org/lc3_adv_awk.php
 
 help: ## Display this help.
+	@echo "For more detailed information consult:"
+	@echo
+	@echo "https://github.com/redhat-appstudio/service-provider-integration-operator/blob/main/docs/DEVELOP.md"
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 ##@ Development
 
-manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+### Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+manifests: controller-gen
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
-	$(MAKE) manifests-kcp
 
-manifests-kcp:	## Generate KCP APIResourceSchema from CRDs
-	hack/generate-kcp-api.sh
-
-generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+### Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+generate: controller-gen
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
 ### fmt: Runs go fmt against code
@@ -141,47 +149,69 @@ check_fmt:
 	    echo "Licenses are not formatted; run 'make fmt_license'"; exit 1 ;\
 	  fi
 
-lint: ## Run the linter on the codebase
+### Run the linter on the codebase
+lint:
   ifeq ($(shell command -v golangci-lint 2> /dev/null),)
 	  $(error "golangci-lint must be installed for this rule" && exit 1)
   endif
 	golangci-lint run
 
-check: check_fmt lint test ## Check that the code conforms to all requirements for commit. Formatting, licenses, vet, tests and linters
-
-vet: ## Run go vet against code.
+### Run go vet against code.
+vet:
 	go vet ./...
 
-test: manifests generate fmt vet envtest ## Run unit tests
+### updates go.mod
+go.mod:
+	go mod download
+	go mod tidy
+
+check: check_fmt lint test ## Check that the code conforms to all requirements for commit. Formatting, licenses, vet, tests and linters
+
+ready: fmt fmt_license go.mod vet lint test ## Make the code ready for commit - formats, lints, vets, updates go.mod and runs tests
+
+test: manifests generate envtest ## Run unit tests
+	$(K8S_CLI) apply -k ./config/crd
 	GOMEGA_DEFAULT_EVENTUALLY_TIMEOUT=10s KUBEBUILDER_ASSETS="$(shell $(ENVTEST) --arch=amd64 use $(ENVTEST_K8S_VERSION) -p path)" go test ./... -coverprofile cover.out -covermode=atomic -coverpkg=./...
 
-itest: manifests generate fmt vet envtest ## Run only integration tests.
-	GOMEGA_DEFAULT_EVENTUALLY_TIMEOUT=10s KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" go test ./integration_tests/...
+itest: manifests generate envtest ## Run only integration tests. Use make itest focus=... to focus Ginkgo only to certain tests
+	GOMEGA_DEFAULT_EVENTUALLY_TIMEOUT=10s KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" go test -v ./integration_tests/... -ginkgo.focus="${focus}" -ginkgo.progress 
 
-
-itest_debug: manifests generate fmt vet envtest ## Start the integration tests in the debugger (suited for "remote debugging")
+itest_debug: manifests generate envtest ## Start the integration tests in the debugger (suited for "remote debugging")
 	$(shell rm ./debug.out)
 	$(shell touch ./debug.out)
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" dlv test --listen=:2345 --headless=true --api-version=2 --accept-multiclient --redirect=stdout:./debug.out --redirect=stderr:./debug.out ./integration_tests -- -test.v -test.run=TestSuite
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" dlv test --listen=:2345 --headless=true --api-version=2 --accept-multiclient --redirect=stdout:./debug.out --redirect=stderr:./debug.out ./integration_tests/... -- -test.v -test.run=TestSuite -ginkgo.focus="${focus}" -ginkgo.progress
 
 ##@ Build
 
-build: generate fmt vet ## Build manager binary.
-	go build -o bin/manager main.go
+build: generate ## Build the operator and oauth service Binaries.
+	go build -o bin/ ./cmd/...
 
-run_as_current_user: manifests generate fmt vet install ## Run a controller from your host as the current user in ~/.kubeconfig
-	go run ./main.go
+run_as_current_user: manifests generate install ## Run the operator from your host as the current user in ~/.kubeconfig
+	go run ./cmd/operator/operator.go
 
-run: ensure-tmp manifests generate fmt vet prepare ## Run a controller from your host using the same RBAC as if deployed in the cluster
+run: ensure-tmp manifests generate prepare ## Run the operator from your host using the same RBAC as if deployed in the cluster
 	$(eval KUBECONFIG:=$(shell hack/generate-restricted-kubeconfig.sh $(TEMP_DIR) spi-controller-manager spi-system))
-	KUBECONFIG=$(KUBECONFIG) go run ./main.go || true
+	KUBECONFIG=$(KUBECONFIG) go run ./cmd/operator/operator.go || true
 	rm $(KUBECONFIG)
 
-docker-build: test ## Build docker image with the manager.
-	docker build -t ${SPIO_IMG} .
+run_oauth: ## Run the OAuth service locally
+	go run ./cmd/oauth/oauth.go
 
-docker-push: ## Push docker image with the manager.
+docker-build: docker-build-operator docker-build-oauth ## Builds the docker images for operator and OAuth service. Use SPI_IMG_BASE and TAG_NAME env vars to modify the image name of both at the same time.
+
+docker-build-operator:
+	docker build -t ${SPIO_IMG}  . -f Dockerfile
+
+docker-build-oauth:
+	docker build -t ${SPIS_IMG} . -f oauth.Dockerfile
+
+docker-push: docker-push-operator docker-push-oauth ## Pushes the built images to the docker registry. See docker-build target for how to configure the names of the images.
+
+docker-push-operator:
 	docker push ${SPIO_IMG}
+
+docker-push-oauth:
+	docker push ${SPIS_IMG}
 
 ##@ Deployment
 
@@ -194,64 +224,43 @@ prepare: install ## In addition to CRDs also install the RBAC rules
 uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config.
 	$(KUSTOMIZE) build config/crd | kubectl delete -f -
 
-deploy: ensure-tmp manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	VAULT_HOST=`hack/vault-host.sh` SPIO_IMG=$(SPIO_IMG) SPIS_IMG=$(SPIS_IMG) hack/replace_placeholders_and_deploy.sh "${KUSTOMIZE}" "default" "default"
-
-deploy_k8s: ensure-tmp manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	SPIO_IMG=$(SPIO_IMG) SPIS_IMG=$(SPIS_IMG) hack/replace_placeholders_and_deploy.sh "${KUSTOMIZE}" "k8s" "k8s"
-	hack/vault-init.sh
+deploy_minikube: ensure-tmp manifests kustomize deploy_vault_minikube ## Deploy controller to the Minikube cluster specified in ~/.kube/config with Vault tokenstorage.
+	OAUTH_HOST=spi.`minikube ip`.nip.io VAULT_HOST=`hack/vault-host.sh` SPIO_IMG=$(SPIO_IMG) SPIS_IMG=$(SPIS_IMG) hack/replace_placeholders_and_deploy.sh "${KUSTOMIZE}" "minikube" "overlays/minikube_vault"
 	kubectl apply -f .tmp/approle_secret.yaml -n spi-system
 
-deploy_minikube: ensure-tmp manifests kustomize deploy_vault_minikube ## Deploy controller to the Minikube cluster specified in ~/.kube/config.
-	OAUTH_HOST=spi.`minikube ip`.nip.io VAULT_HOST=`hack/vault-host.sh` SPIO_IMG=$(SPIO_IMG) SPIS_IMG=$(SPIS_IMG) hack/replace_placeholders_and_deploy.sh "${KUSTOMIZE}" "minikube" "minikube"
+deploy_minikube_aws: ensure-tmp manifests kustomize ## Deploy controller to the Minikube cluster specified in ~/.kube/config with AWS tokenstorage.
+	OAUTH_HOST=spi.`minikube ip`.nip.io SPIO_IMG=$(SPIO_IMG) SPIS_IMG=$(SPIS_IMG) hack/replace_placeholders_and_deploy.sh "${KUSTOMIZE}" "minikube" "overlays/minikube_aws"
+	echo "secret 'aws-secretsmanager-credentials' with aws credentials must be manually created, './hack/aws-create-credentials-secret.sh' can help"
+
+deploy_openshift: ensure-tmp manifests kustomize deploy_vault_openshift ## Deploy controller to the Openshift cluster specified in ~/.kube/config using the OpenShift kustomization with Vault tokenstorage
+	OAUTH_HOST=`hack/spi-host-openshift.sh` VAULT_HOST=`./hack/vault-host.sh` SPIO_IMG=$(SPIO_IMG) SPIS_IMG=$(SPIS_IMG) hack/replace_placeholders_and_deploy.sh "${KUSTOMIZE}" "openshift" "overlays/openshift_vault"
 	kubectl apply -f .tmp/approle_secret.yaml -n spi-system
 
-deploy_openshift: ensure-tmp manifests kustomize deploy_vault_openshift ## Deploy controller to the K8s cluster specified in ~/.kube/config using the example OpenShift kustomization
-	VAULT_HOST=`./hack/vault-host.sh` SPIO_IMG=$(SPIO_IMG) SPIS_IMG=$(SPIS_IMG) hack/replace_placeholders_and_deploy.sh "${KUSTOMIZE}" "openshift-example" "openshift-example"
-	kubectl apply -f .tmp/approle_secret.yaml -n spi-system
-
-deploy_kcp: ensure-tmp manifests kustomize
-	if [ -z ${VAULT_HOST} ]; then echo "VAULT_HOST must be set"; exit 1; fi
-	$(eval KCP_WORKSPACE?=$(shell kubectl kcp workspace . --short))
-	KCP_WORKSPACE=$(KCP_WORKSPACE) SPIO_IMG=$(SPIO_IMG) SPIS_IMG=$(SPIS_IMG) hack/replace_placeholders_and_deploy.sh "${KUSTOMIZE}" "kcp" "kcp"
-	kubectl apply -f .tmp/approle_secret.yaml -n spi-system
-	kubectl apply -f .tmp/deployment_kcp/kcp/apibinding_spi.yaml
-
-deploy_kcp_openshift: ensure-tmp manifests kustomize
-	if [ -z ${VAULT_HOST} ]; then echo "VAULT_HOST must be set"; exit 1; fi
-	$(eval KCP_WORKSPACE?=$(shell kubectl kcp workspace . --short))
-	KCP_WORKSPACE=$(KCP_WORKSPACE) SPIO_IMG=$(SPIO_IMG) SPIS_IMG=$(SPIS_IMG) hack/replace_placeholders_and_deploy.sh "${KUSTOMIZE}" "kcp" "kcp_openshift"
-	kubectl apply -f .tmp/approle_secret.yaml -n spi-system
-	kubectl apply -f .tmp/deployment_kcp/kcp/apibinding_spi.yaml
-
-undeploy_k8s: undeploy_vault_k8s ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
-	if [ ! -d ${TEMP_DIR}/deployment_k8s ]; then echo "No deployment files found in .tmp/deployment_k8s"; exit 1; fi
-	$(KUSTOMIZE) build ${TEMP_DIR}/deployment_k8s/k8s | kubectl delete -f -
+deploy_openshift_aws: ensure-tmp manifests kustomize ## Deploy controller to the Openshift cluster specified in ~/.kube/config using the OpenShift kustomization with AWS tokenstorage
+	OAUTH_HOST=`hack/spi-host-openshift.sh` SPIO_IMG=$(SPIO_IMG) SPIS_IMG=$(SPIS_IMG) hack/replace_placeholders_and_deploy.sh "${KUSTOMIZE}" "openshift" "overlays/openshift_aws"
+	echo "secret 'aws-secretsmanager-credentials' with aws credentials must be manually created, './hack/aws-create-credentials-secret.sh' can help"
 
 undeploy_minikube: undeploy_vault_k8s ## Undeploy controller from the Minikube cluster specified in ~/.kube/config.
 	if [ ! -d ${TEMP_DIR}/deployment_minikube ]; then echo "No deployment files found in .tmp/deployment_minikube"; exit 1; fi
-	$(KUSTOMIZE) build ${TEMP_DIR}/deployment_minikube/k8s | kubectl delete -f -
+	$(KUSTOMIZE) build ${TEMP_DIR}/deployment_minikube/default | kubectl delete -f -
 
-undeploy_kcp:
-	if [ ! -d ${TEMP_DIR}/deployment_kcp ]; then echo "No deployment files found in .tmp/deployment_kcp"; exit 1; fi
-	$(KUSTOMIZE) build ${TEMP_DIR}/deployment_kcp/kcp | kubectl delete -f -
-
-undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
-	$(KUSTOMIZE) build ${TEMP_DIR}/deployment_default/default | kubectl delete -f -
+undeploy_openshift: undeploy_vault_openshift ## Undeploy controller from the Openshift cluster specified in ~/.kube/config.
+	if [ ! -d ${TEMP_DIR}/deployment_openshift ]; then echo "No deployment files found in .tmp/deployment_openshift"; exit 1; fi
+	$(KUSTOMIZE) build ${TEMP_DIR}/deployment_openshift/default | kubectl delete -f -
 
 deploy_vault_openshift:
 	$(KUSTOMIZE) build config/vault/openshift | kubectl apply -f -
 	POD_NAME=vault-0 NAMESPACE=spi-vault hack/vault-init.sh
 
-undeploy_vault_openshift:
-	$(KUSTOMIZE) build config/vault/openshift | kubectl delete -f -
+undeploy_vault_openshift: kustomize
+	$(KUSTOMIZE) build config/vault/openshift | kubectl delete -f - || true
 
-deploy_vault_minikube:
+deploy_vault_minikube: kustomize
 	VAULT_HOST=vault.`minikube ip`.nip.io hack/replace_placeholders_and_deploy.sh "${KUSTOMIZE}" "vault_k8s" "vault/k8s"
 	VAULT_NAMESPACE=spi-vault POD_NAME=vault-0 hack/vault-init.sh
 
-undeploy_vault_k8s:
-	$(KUSTOMIZE) build ${TEMP_DIR}/deployment_vault_k8s/vault/k8s | kubectl delete -f -
+undeploy_vault_k8s: kustomize
+	$(KUSTOMIZE) build ${TEMP_DIR}/deployment_vault_k8s/vault/k8s | kubectl delete -f - || true
 
 ##@ Build Dependencies
 
@@ -273,7 +282,7 @@ KUSTOMIZE_INSTALL_SCRIPT ?= "https://raw.githubusercontent.com/kubernetes-sigs/k
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
-	curl -s $(KUSTOMIZE_INSTALL_SCRIPT) | bash -s -- $(subst v,,$(KUSTOMIZE_VERSION)) $(LOCALBIN)
+	test -s $(LOCALBIN)/kustomize || { curl -Ss $(KUSTOMIZE_INSTALL_SCRIPT) | bash -s -- $(subst v,,$(KUSTOMIZE_VERSION)) $(LOCALBIN); }
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.

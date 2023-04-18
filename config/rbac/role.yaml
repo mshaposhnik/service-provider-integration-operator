@@ -8,7 +8,29 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - events
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - secrets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - serviceaccounts
   verbs:
   - create
   - delete
@@ -73,6 +95,7 @@ rules:
   resources:
   - spiaccesstokendataupdates
   verbs:
+  - create
   - delete
   - get
   - list
@@ -99,6 +122,32 @@ rules:
   - appstudio.redhat.com
   resources:
   - spiaccesstokens/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - appstudio.redhat.com
+  resources:
+  - spifilecontentrequests
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - appstudio.redhat.com
+  resources:
+  - spifilecontentrequests/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - appstudio.redhat.com
+  resources:
+  - spifilecontentrequests/status
   verbs:
   - get
   - patch

@@ -15,6 +15,13 @@
 package integrationtests
 
 import (
+	"github.com/onsi/ginkgo"
+	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/kubernetesclient"
+	"golang.org/x/oauth2"
+
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
 	"context"
 	"net/http"
 	"path/filepath"
@@ -22,19 +29,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/logs"
 
 	apiexv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-
-	"github.com/hashicorp/vault/vault"
+	"k8s.io/client-go/rest"
 
 	config2 "github.com/onsi/ginkgo/config"
 
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/tokenstorage"
+	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/tokenstorage/memorystorage"
 
 	opconfig "github.com/redhat-appstudio/service-provider-integration-operator/pkg/config"
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/serviceprovider"
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/config"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -56,23 +66,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
-type IntegrationTest struct {
-	Client                   client.Client
-	NoPrivsClient            client.Client
-	TestEnvironment          *envtest.Environment
-	Context                  context.Context
-	TokenStorage             tokenstorage.TokenStorage
-	Cancel                   context.CancelFunc
-	TestServiceProviderProbe serviceprovider.Probe
-	TestServiceProvider      TestServiceProvider
-	HostCredsServiceProvider TestServiceProvider
-	VaultTestCluster         *vault.TestCluster
-	OperatorConfiguration    *opconfig.OperatorConfiguration
+var testServiceProvider = config.ServiceProviderType{
+	Name: "TestServiceProvider",
 }
-
-var ITest IntegrationTest
-
-var _ serviceprovider.ServiceProvider = (*TestServiceProvider)(nil)
 
 func TestSuite(t *testing.T) {
 	RegisterFailHandler(Fail)
@@ -90,11 +86,11 @@ var _ = BeforeSuite(func() {
 	logs.InitDevelLoggers()
 	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 
-	ITest = IntegrationTest{}
-
 	ctx, cancel := context.WithCancel(context.TODO())
 	ITest.Context = ctx
 	ITest.Cancel = cancel
+
+	ITest.MetricsRegistry = prometheus.NewPedanticRegistry()
 
 	By("bootstrapping test environment")
 	testEnv := &envtest.Environment{
@@ -139,16 +135,34 @@ var _ = BeforeSuite(func() {
 	cl, err := client.New(cfg, client.Options{Scheme: scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(cl).NotTo(BeNil())
-	ITest.Client = cl
+
+	// Let's configure the logging client as a pass-through, not outputting anything to not clobber up the logs too much.
+	// Configure it in case you're having trouble understanding when and where the interactions with K8s API are happening.
+	logK8sReads := false
+	logK8sWrites := false
+	includeStacktracesInK8sWrites := false
+	lgCl := &LoggingKubernetesClient{
+		Client:             cl,
+		LogReads:           logK8sReads,
+		LogWrites:          logK8sWrites,
+		IncludeStacktraces: includeStacktracesInK8sWrites,
+	}
+
+	ITest.Client = lgCl
 
 	noPrivsClient, err := client.New(noPrivsUser.Config(), client.Options{
 		Scheme: scheme,
 	})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(noPrivsClient).NotTo(BeNil())
-	ITest.NoPrivsClient = noPrivsClient
+	ITest.NoPrivsClient = &LoggingKubernetesClient{
+		Client:             noPrivsClient,
+		LogReads:           logK8sReads,
+		LogWrites:          logK8sWrites,
+		IncludeStacktraces: logK8sWrites,
+	}
 
-	ITest.TestServiceProvider = TestServiceProvider{}
+	ITest.TestServiceProvider = serviceprovider.TestServiceProvider{}
 	ITest.TestServiceProviderProbe = serviceprovider.ProbeFunc(func(_ *http.Client, baseUrl string) (string, error) {
 		if strings.HasPrefix(baseUrl, "test-provider://") {
 			return "test-provider://baseurl", nil
@@ -156,30 +170,56 @@ var _ = BeforeSuite(func() {
 
 		return "", nil
 	})
-	ITest.HostCredsServiceProvider = TestServiceProvider{
-		GetTypeImpl: func() api.ServiceProviderType {
-			return "HostCredsServiceProvider"
-		},
+	config.SupportedServiceProviderTypes = []config.ServiceProviderType{ITest.TestServiceProvider.GetType()}
+	ITest.ValidationOptions = config.CustomValidationOptions{AllowInsecureURLs: true}
 
-		GetBaseUrlImpl: func() string {
-			return "not-test-provider://not-baseurl"
-		},
+	ITest.Capabilities = serviceprovider.TestCapabilities{}
+
+	ITest.Capabilities.DownloadFileImpl = func(_ context.Context, _ string, _ string, _ string, _ *api.SPIAccessToken, i int) (string, error) {
+		return "abcdefg", nil
 	}
+
+	ITest.Capabilities.GetOAuthEndpointImpl = func() string {
+		return ITest.OperatorConfiguration.BaseUrl + "/test/oauth"
+	}
+
+	ITest.Capabilities.OAuthScopesForImpl = func(_ *api.Permissions) []string {
+		return []string{}
+	}
+
+	ITest.HostCredsServiceProvider = serviceprovider.TestServiceProvider{}
+	ITest.HostCredsServiceProvider.CustomizeReset = func(provider *serviceprovider.TestServiceProvider) {
+		provider.GetTypeImpl = func() config.ServiceProviderType {
+			return config.ServiceProviderTypeHostCredentials
+		}
+		provider.GetBaseUrlImpl = func() string {
+			return "not-test-provider://not-baseurl"
+		}
+	}
+	ITest.HostCredsServiceProvider.Reset()
 
 	ITest.OperatorConfiguration = &opconfig.OperatorConfiguration{
 		SharedConfiguration: config.SharedConfiguration{
 			ServiceProviders: []config.ServiceProviderConfiguration{
 				{
-					ClientId:            "testClient",
-					ClientSecret:        "testSecret",
-					ServiceProviderType: "TestServiceProvider",
+					OAuth2Config: &oauth2.Config{
+						ClientID:     "testClient",
+						ClientSecret: "testSecret",
+					},
+					ServiceProviderType: testServiceProvider,
+				},
+				{
+					ServiceProviderBaseUrl: "https://spi-club.org",
+					ServiceProviderType:    config.ServiceProviderType{Name: "SpiClub"},
 				},
 			},
 		},
 		AccessCheckTtl:        10 * time.Second,
 		AccessTokenTtl:        10 * time.Second,
 		AccessTokenBindingTtl: 10 * time.Second,
+		FileContentRequestTtl: 10 * time.Second,
 		DeletionGracePeriod:   10 * time.Second,
+		EnableTokenUpload:     true,
 	}
 
 	// start webhook server using Manager
@@ -191,44 +231,50 @@ var _ = BeforeSuite(func() {
 		CertDir:            webhookInstallOptions.LocalServingCertDir,
 		LeaderElection:     false,
 		MetricsBindAddress: "0",
+		NewClient: func(cache cache.Cache, config *rest.Config, options client.Options, uncachedObjects ...client.Object) (client.Client, error) {
+			cl, err := cluster.DefaultNewClient(cache, config, options, uncachedObjects...)
+			if err != nil {
+				return nil, err
+			}
+
+			return &LoggingKubernetesClient{
+				Client:             cl,
+				LogReads:           logK8sReads,
+				LogWrites:          logK8sWrites,
+				IncludeStacktraces: includeStacktracesInK8sWrites,
+			}, nil
+		},
 	})
 	Expect(err).NotTo(HaveOccurred())
 
-	var strg tokenstorage.TokenStorage
-	ITest.VaultTestCluster, strg, _, _ = tokenstorage.CreateTestVaultTokenStorageWithAuth(GinkgoT())
-	Expect(err).NotTo(HaveOccurred())
+	strg := &memorystorage.MemoryTokenStorage{}
 
 	ITest.TokenStorage = &tokenstorage.NotifyingTokenStorage{
-		Client:       cl,
-		TokenStorage: strg,
+		ClientFactory: kubernetesclient.SingleInstanceClientFactory{Client: ITest.Client},
+		TokenStorage:  strg,
 	}
 
 	Expect(ITest.TokenStorage.Initialize(ctx)).To(Succeed())
 
-	factory := serviceprovider.Factory{
-		Configuration:    ITest.OperatorConfiguration,
-		KubernetesClient: mgr.GetClient(),
-		HttpClient:       http.DefaultClient,
-		Initializers: map[config.ServiceProviderType]serviceprovider.Initializer{
-			"TestServiceProvider": {
+	initializers := serviceprovider.NewInitializers().
+		AddKnownInitializer(config.ServiceProviderType{Name: "TestServiceProvider"},
+			serviceprovider.Initializer{
 				Probe: serviceprovider.ProbeFunc(func(cl *http.Client, baseUrl string) (string, error) {
 					return ITest.TestServiceProviderProbe.Examine(cl, baseUrl)
 				}),
-				Constructor: serviceprovider.ConstructorFunc(func(f *serviceprovider.Factory, _ string) (serviceprovider.ServiceProvider, error) {
+				Constructor: serviceprovider.ConstructorFunc(func(f *serviceprovider.Factory, _ *config.ServiceProviderConfiguration) (serviceprovider.ServiceProvider, error) {
 					return ITest.TestServiceProvider, nil
 				}),
-			},
-			"HostCredentials": {
+			}).
+		AddKnownInitializer(config.ServiceProviderType{Name: "HostCredentials"},
+			serviceprovider.Initializer{
 				Probe: serviceprovider.ProbeFunc(func(cl *http.Client, baseUrl string) (string, error) {
 					return ITest.TestServiceProviderProbe.Examine(cl, baseUrl)
 				}),
-				Constructor: serviceprovider.ConstructorFunc(func(f *serviceprovider.Factory, _ string) (serviceprovider.ServiceProvider, error) {
+				Constructor: serviceprovider.ConstructorFunc(func(f *serviceprovider.Factory, _ *config.ServiceProviderConfiguration) (serviceprovider.ServiceProvider, error) {
 					return ITest.HostCredsServiceProvider, nil
 				}),
-			},
-		},
-		TokenStorage: strg,
-	}
+			})
 
 	// the controllers themselves do not need the notifying token storage because they operate in the cluster
 	// the notifying token storage is only needed if changes are only made to the storage and the cluster needs to be
@@ -236,38 +282,8 @@ var _ = BeforeSuite(func() {
 	// storage so that the controllers can react to the changes made to the token storage by the testsuite but the
 	// controllers themselves use the "raw" token storage because they only write to the storage based on the conditions
 	// in the cluster.
-	err = (&controllers.SPIAccessTokenReconciler{
-		Client:                 mgr.GetClient(),
-		Scheme:                 mgr.GetScheme(),
-		TokenStorage:           strg,
-		Configuration:          ITest.OperatorConfiguration,
-		ServiceProviderFactory: factory,
-	}).SetupWithManager(mgr)
+	err = controllers.SetupAllReconcilers(mgr, ITest.OperatorConfiguration, strg, initializers)
 	Expect(err).NotTo(HaveOccurred())
-
-	err = (&controllers.SPIAccessTokenBindingReconciler{
-		Client:                 mgr.GetClient(),
-		Scheme:                 mgr.GetScheme(),
-		TokenStorage:           strg,
-		Configuration:          ITest.OperatorConfiguration,
-		ServiceProviderFactory: factory,
-	}).SetupWithManager(mgr)
-	Expect(err).NotTo(HaveOccurred())
-
-	err = (&controllers.SPIAccessTokenDataUpdateReconciler{
-		Client: mgr.GetClient(),
-	}).SetupWithManager(mgr)
-	Expect(err).NotTo(HaveOccurred())
-
-	err = (&controllers.SPIAccessCheckReconciler{
-		Client:                 mgr.GetClient(),
-		Scheme:                 mgr.GetScheme(),
-		ServiceProviderFactory: factory,
-		Configuration:          ITest.OperatorConfiguration,
-	}).SetupWithManager(mgr)
-	Expect(err).NotTo(HaveOccurred())
-
-	//+kubebuilder:scaffold:webhook
 
 	go func() {
 		err = mgr.Start(ctx)
@@ -290,4 +306,29 @@ var _ = AfterSuite(func() {
 		err := ITest.TestEnvironment.Stop()
 		Expect(err).NotTo(HaveOccurred())
 	}
+})
+
+var _ = BeforeEach(func() {
+	log.Log.Info(">>>>>>>")
+	log.Log.Info(">>>>>>>")
+	log.Log.Info(">>>>>>>")
+	log.Log.Info(">>>>>>>")
+	log.Log.Info(">>>>>>>", "test", ginkgo.CurrentGinkgoTestDescription().FullTestText)
+	log.Log.Info(">>>>>>>")
+	log.Log.Info(">>>>>>>")
+	log.Log.Info(">>>>>>>")
+	log.Log.Info(">>>>>>>")
+})
+
+var _ = AfterEach(func() {
+	testDesc := ginkgo.CurrentGinkgoTestDescription()
+	log.Log.Info("<<<<<<<")
+	log.Log.Info("<<<<<<<")
+	log.Log.Info("<<<<<<<")
+	log.Log.Info("<<<<<<<")
+	log.Log.Info("<<<<<<<", "test", testDesc.FullTestText, "duration", testDesc.Duration, "failed", testDesc.Failed)
+	log.Log.Info("<<<<<<<")
+	log.Log.Info("<<<<<<<")
+	log.Log.Info("<<<<<<<")
+	log.Log.Info("<<<<<<<")
 })

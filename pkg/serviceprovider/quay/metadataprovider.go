@@ -22,14 +22,26 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/logs"
+
+	k8sMetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/serviceprovider"
+	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/config"
+	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/httptransport"
+	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/metrics"
+
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	api "github.com/redhat-appstudio/service-provider-integration-operator/api/v1beta1"
-	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/serviceprovider"
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/tokenstorage"
 )
+
+var metricsConfig = serviceprovider.CommonRequestMetricsConfig(config.ServiceProviderTypeQuay, "fetch_repo_metadata")
 
 type metadataProvider struct {
 	tokenStorage     tokenstorage.TokenStorage
@@ -41,8 +53,42 @@ type metadataProvider struct {
 var _ serviceprovider.MetadataProvider = (*metadataProvider)(nil)
 var invalidRepoUrl = errors.New("invalid repository URL")
 
-func (p metadataProvider) Fetch(ctx context.Context, token *api.SPIAccessToken) (*api.TokenMetadata, error) {
-	lg := log.FromContext(ctx, "tokenName", token.Name, "tokenNamespace", token.Namespace)
+// registered in newQuay function
+var metadataFetchMetric = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	Namespace:   config.MetricsNamespace,
+	Subsystem:   config.MetricsSubsystem,
+	Name:        "quay_single_repo_metadata_fetch_seconds",
+	Help:        "Measures the overall time to load all the metadata for a single repository or organization per token",
+	ConstLabels: nil,
+	Buckets:     nil,
+}, []string{"failure"})
+
+// pre-create the individual metrics for each label value for perf reasons
+var metadataFetchSuccessMetric = metadataFetchMetric.WithLabelValues("false")
+var metadataFetchFailureMetric = metadataFetchMetric.WithLabelValues("true")
+
+func metadataFetchTimer() metrics.ValueTimer3[*RepositoryMetadata, bool, error] {
+	return metrics.NewValueTimer3[*RepositoryMetadata, bool, error](metrics.ValueObserverFunc3[*RepositoryMetadata, bool, error](func(m *RepositoryMetadata, cached bool, err error, dur float64) {
+		if err == nil {
+			if m != nil && !cached {
+				// only collect the success if there was any metadata actually fetched. If there was no error and no
+				// metadata fetched, there must have been no token therefore it makes no sense to even talk about
+				// metadata fetching.
+				// We're also not measuring the time it takes to look up the metadata in the cache.
+				metadataFetchSuccessMetric.Observe(dur)
+			}
+		} else {
+			metadataFetchFailureMetric.Observe(dur)
+		}
+	}))
+}
+
+func init() {
+	k8sMetrics.Registry.MustRegister(metadataFetchMetric)
+}
+
+func (p metadataProvider) Fetch(ctx context.Context, token *api.SPIAccessToken, includeState bool) (*api.TokenMetadata, error) {
+	lg := log.FromContext(ctx, "tokenName", token.Name, "tokenNamespace", token.Namespace).V(logs.DebugLevel)
 
 	data, err := p.tokenStorage.Get(ctx, token)
 	if err != nil {
@@ -52,6 +98,22 @@ func (p metadataProvider) Fetch(ctx context.Context, token *api.SPIAccessToken) 
 
 	if data == nil {
 		return nil, nil
+	}
+
+	metadata := token.Status.TokenMetadata
+	if metadata == nil {
+		metadata = &api.TokenMetadata{}
+		token.Status.TokenMetadata = metadata
+	}
+
+	if len(data.Username) > 0 {
+		metadata.Username = data.Username
+	} else {
+		metadata.Username = OAuthTokenUserName
+	}
+
+	if !includeState {
+		return metadata, nil
 	}
 
 	// This method is called when we need to refresh (or obtain anew, after cache expiry) the metadata of the token.
@@ -66,18 +128,6 @@ func (p metadataProvider) Fetch(ctx context.Context, token *api.SPIAccessToken) 
 	if err != nil {
 		lg.Error(err, "failed to serialize the token metadata, this should not happen")
 		return nil, fmt.Errorf("failed to marshal the state to JSON: %w", err)
-	}
-
-	metadata := token.Status.TokenMetadata
-	if metadata == nil {
-		metadata = &api.TokenMetadata{}
-		token.Status.TokenMetadata = metadata
-	}
-
-	if len(data.Username) > 0 {
-		metadata.Username = data.Username
-	} else {
-		metadata.Username = OAuthTokenUserName
 	}
 
 	metadata.ServiceProviderState = js
@@ -96,8 +146,14 @@ type RepositoryMetadata struct {
 
 // FetchRepo is the iterative version of Fetch used internally in the Quay service provider. It takes care of both
 // fetching and caching of the data on per-repository basis.
-func (p metadataProvider) FetchRepo(ctx context.Context, repoUrl string, token *api.SPIAccessToken) (metadata RepositoryMetadata, err error) {
-	lg := log.FromContext(ctx, "repo", repoUrl, "tokenName", token.Name, "tokenNamespace", token.Namespace)
+func (p metadataProvider) FetchRepo(ctx context.Context, repoUrl string, token *api.SPIAccessToken) (*RepositoryMetadata, error) {
+	timer := metadataFetchTimer()
+	metadata, _, err := timer.ObserveValuesAndDuration(p.doFetchRepo(ctx, repoUrl, token))
+	return metadata, err
+}
+
+func (p metadataProvider) doFetchRepo(ctx context.Context, repoUrl string, token *api.SPIAccessToken) (metadata *RepositoryMetadata, cached bool, err error) {
+	lg := log.FromContext(ctx, "repo", repoUrl, "tokenName", token.Name, "tokenNamespace", token.Namespace).V(logs.DebugLevel)
 
 	lg.Info("fetching repository metadata")
 
@@ -107,20 +163,20 @@ func (p metadataProvider) FetchRepo(ctx context.Context, repoUrl string, token *
 	}
 
 	quayState := TokenState{}
-	if err = json.Unmarshal(token.Status.TokenMetadata.ServiceProviderState, &quayState); err != nil {
-		lg.Error(err, "failed to unmarshal quay token state")
-		err = fmt.Errorf("failed to unmarshal the token state: %w", err)
-		return
+	// the service provider state may be nil, so we need to be careful here
+	stateBytes := token.Status.TokenMetadata.ServiceProviderState
+	if len(stateBytes) > 0 {
+		if err = json.Unmarshal(stateBytes, &quayState); err != nil {
+			lg.Error(err, "failed to unmarshal quay token state")
+			err = fmt.Errorf("failed to unmarshal the token state: %w", err)
+			return
+		}
 	}
-	if quayState.Repositories == nil || quayState.Organizations == nil {
-		lg.Info("Detected quay token state with empty Repositories or Organizations")
-		if quayState.Repositories == nil {
-			quayState.Repositories = make(map[string]EntityRecord)
-		}
-
-		if quayState.Organizations == nil {
-			quayState.Organizations = make(map[string]EntityRecord)
-		}
+	if quayState.Repositories == nil {
+		quayState.Repositories = make(map[string]EntityRecord)
+	}
+	if quayState.Organizations == nil {
+		quayState.Organizations = make(map[string]EntityRecord)
 	}
 
 	var tokenData *api.Token
@@ -135,6 +191,8 @@ func (p metadataProvider) FetchRepo(ctx context.Context, repoUrl string, token *
 		lg.Info("no token data found")
 		return
 	}
+
+	ctx = httptransport.ContextWithMetrics(ctx, metricsConfig)
 
 	orgOrUser, repo, _ := splitToOrganizationAndRepositoryAndVersion(repoUrl)
 	if orgOrUser == "" || repo == "" {
@@ -201,10 +259,12 @@ func (p metadataProvider) FetchRepo(ctx context.Context, repoUrl string, token *
 		}
 	}
 
-	return RepositoryMetadata{
+	metadata = &RepositoryMetadata{
 		Repository:   repoRecord,
 		Organization: orgRecord,
-	}, nil
+	}
+
+	return
 }
 
 // helper types for getEntityRecord parameters
@@ -223,7 +283,7 @@ func (p metadataProvider) getEntityRecord(ctx context.Context, tokenData *api.To
 	if !present || time.Now().After(time.Unix(rec.LastRefreshTime, 0).Add(p.ttl)) {
 		lg.Info("entity metadata stale, reloading")
 
-		var repoRec *EntityRecord
+		var entityRec *EntityRecord
 
 		var loginInfo LoginTokenInfo
 		loginInfo, err = loginInfoFn()
@@ -232,20 +292,20 @@ func (p metadataProvider) getEntityRecord(ctx context.Context, tokenData *api.To
 			return
 		}
 
-		repoRec, err = fetchFn(ctx, p.httpClient, key, tokenData, loginInfo)
+		entityRec, err = fetchFn(ctx, p.httpClient, key, tokenData, loginInfo)
 		if err != nil {
 			lg.Error(err, "failed to fetch the metadata entity")
 			return
 		}
 
-		if repoRec == nil {
-			repoRec = &EntityRecord{}
+		if entityRec == nil {
+			entityRec = &EntityRecord{}
 		}
 
-		repoRec.LastRefreshTime = time.Now().Unix()
+		entityRec.LastRefreshTime = time.Now().Unix()
 
-		cache[key] = *repoRec
-		rec = *repoRec
+		cache[key] = *entityRec
+		rec = *entityRec
 		changed = true
 		lg.Info("metadata entity fetched successfully")
 	} else {

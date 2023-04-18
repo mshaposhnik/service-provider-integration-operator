@@ -15,10 +15,7 @@
 package config
 
 import (
-	"fmt"
 	"time"
-
-	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/tokenstorage"
 
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/config"
 )
@@ -30,20 +27,6 @@ const (
 	AnyTokenPolicy   TokenPolicy = "any"
 	ExactTokenPolicy TokenPolicy = "exact"
 )
-
-type OperatorCliArgs struct {
-	config.CommonCliArgs
-	config.LoggingCliArgs
-	tokenstorage.VaultCliArgs
-	EnableLeaderElection        bool          `arg:"--leader-elect, env" default:"false" help:"Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager."`
-	TokenMetadataCacheTtl       time.Duration `arg:"--metadata-cache-ttl, env" default:"1h" help:"The maximum age of token metadata data cache"`
-	TokenLifetimeDuration       time.Duration `arg:"--token-ttl, env" default:"120h" help:"the time after which a token will be automatically deleted in hours, minutes or seconds. Examples:  \"3h\",  \"5h30m40s\" etc"`
-	BindingLifetimeDuration     time.Duration `arg:"--binding-ttl, env" default:"2h" help:"the time after which a token binding will be automatically deleted in hours, minutes or seconds. Examples: \"3h\", \"5h30m40s\" etc"`
-	AccessCheckLifetimeDuration time.Duration `arg:"--access-check-ttl, env" default:"30m" help:"the time after which SPIAccessCheck CR will be deleted by operator"`
-	TokenMatchPolicy            TokenPolicy   `arg:"--token-match-policy, env" default:"any" help:"The policy to match the token against the binding. Options:  'any', 'exact'."`
-	ApiExportName               string        `arg:"--kcp-api-export-name, env" default:"spi" help:"SPI ApiExport name used in KCP environment to configure controller with virtual workspace."`
-	DeletionGracePeriod         time.Duration `arg:"--deletion-grace-period, env" default:"2s" help:"The grace period between a condition for deleting a binding or token is satisfied and the token or binding actually being deleted."`
-}
 
 type OperatorConfiguration struct {
 	config.SharedConfiguration
@@ -60,26 +43,18 @@ type OperatorConfiguration struct {
 	// AccessTokenBindingTtl is time after that AccessTokenBinding will be deleted.
 	AccessTokenBindingTtl time.Duration
 
+	//FileContentRequestTtl is time after that FileContentRequest will be deleted
+	FileContentRequestTtl time.Duration
+
 	// The policy to match the token against the binding
 	TokenMatchPolicy TokenPolicy
 
 	// The time before a token without data and with no bindings is automatically deleted.
 	DeletionGracePeriod time.Duration
-}
 
-func LoadFrom(args *OperatorCliArgs) (OperatorConfiguration, error) {
-	baseCfg, err := config.LoadFrom(&args.CommonCliArgs)
-	if err != nil {
-		return OperatorConfiguration{}, fmt.Errorf("failed to load the configuration file from %s: %w", args.ConfigFile, err)
-	}
-	ret := OperatorConfiguration{SharedConfiguration: baseCfg}
+	// A maximum file size for file downloading from SCM capabilities supporting providers
+	MaxFileDownloadSize int
 
-	ret.TokenLookupCacheTtl = args.TokenMetadataCacheTtl
-	ret.AccessCheckTtl = args.AccessCheckLifetimeDuration
-	ret.AccessTokenTtl = args.TokenLifetimeDuration
-	ret.AccessTokenBindingTtl = args.BindingLifetimeDuration
-	ret.TokenMatchPolicy = args.TokenMatchPolicy
-	ret.DeletionGracePeriod = args.DeletionGracePeriod
-
-	return ret, nil
+	// Enable Token Upload controller
+	EnableTokenUpload bool
 }

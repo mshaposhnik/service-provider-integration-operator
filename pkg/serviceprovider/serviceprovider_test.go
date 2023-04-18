@@ -16,9 +16,19 @@ package serviceprovider
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"testing"
+
+	"github.com/go-playground/validator/v10"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	opconfig "github.com/redhat-appstudio/service-provider-integration-operator/pkg/config"
 
@@ -117,7 +127,7 @@ func TestFromRepoUrl(t *testing.T) {
 	mockSP := struct {
 		ServiceProvider
 	}{}
-
+	config.SetupCustomValidations(config.CustomValidationOptions{AllowInsecureURLs: false})
 	mockInit := Initializer{
 		Probe: struct {
 			ProbeFunc
@@ -129,24 +139,331 @@ func TestFromRepoUrl(t *testing.T) {
 		Constructor: struct {
 			ConstructorFunc
 		}{
-			ConstructorFunc: func(factory *Factory, baseUrl string) (ServiceProvider, error) {
+			ConstructorFunc: func(factory *Factory, _ *config.ServiceProviderConfiguration) (ServiceProvider, error) {
 				return mockSP, nil
 			},
 		},
-		SupportsManualUploadOnlyMode: true,
 	}
+
+	scheme := runtime.NewScheme()
+	utilruntime.Must(v1.AddToScheme(scheme))
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects().Build()
+
+	initializers := NewInitializers().
+		AddKnownInitializer(config.ServiceProviderTypeQuay, mockInit)
 
 	fact := Factory{
 		Configuration:    &opconfig.OperatorConfiguration{},
-		KubernetesClient: nil,
+		KubernetesClient: cl,
 		HttpClient:       nil,
-		Initializers: map[config.ServiceProviderType]Initializer{
-			config.ServiceProviderTypeQuay: mockInit,
-		},
-		TokenStorage: nil,
+		TokenStorage:     nil,
+		Initializers:     initializers,
 	}
 
-	sp, err := fact.FromRepoUrl(context.TODO(), "quay.com/namespace/repo")
+	config.SupportedServiceProviderTypes = []config.ServiceProviderType{config.ServiceProviderTypeQuay}
+
+	sp, err := fact.FromRepoUrl(context.TODO(), "quay.com/namespace/repo", "namespace")
 	assert.NoError(t, err)
 	assert.Equal(t, mockSP, sp)
+}
+
+func TestCreateHostCredentialsProvider(t *testing.T) {
+	mockSP := struct {
+		ServiceProvider
+	}{}
+	mockInit := Initializer{
+		Probe: struct {
+			ProbeFunc
+		}{
+			ProbeFunc: func(cl *http.Client, url string) (string, error) {
+				return "https://base-url.com", nil
+			},
+		},
+		Constructor: struct {
+			ConstructorFunc
+		}{
+			ConstructorFunc: func(factory *Factory, _ *config.ServiceProviderConfiguration) (ServiceProvider, error) {
+				return mockSP, nil
+			},
+		},
+	}
+
+	t.Run("created ok", func(t *testing.T) {
+		f := Factory{
+			Initializers: NewInitializers().AddKnownInitializer(config.ServiceProviderTypeHostCredentials, mockInit),
+		}
+
+		repoUrl, _ := url.Parse("https://blabol.sp/hey/there")
+
+		sp, err := f.createHostCredentialsProvider(repoUrl)
+
+		assert.NotNil(t, sp)
+		assert.NoError(t, err)
+	})
+
+	t.Run("missing initializer", func(t *testing.T) {
+		f := Factory{
+			Initializers: NewInitializers().AddKnownInitializer(config.ServiceProviderTypeQuay, mockInit),
+		}
+
+		repoUrl, _ := url.Parse("https://blabol.sp/hey/there")
+
+		sp, err := f.createHostCredentialsProvider(repoUrl)
+
+		assert.Nil(t, sp)
+		assert.Error(t, err)
+	})
+
+	t.Run("failed constructor", func(t *testing.T) {
+		mockInit := Initializer{
+			Probe: struct {
+				ProbeFunc
+			}{
+				ProbeFunc: func(cl *http.Client, url string) (string, error) {
+					return "https://base-url.com", nil
+				},
+			},
+			Constructor: struct {
+				ConstructorFunc
+			}{
+				ConstructorFunc: func(factory *Factory, _ *config.ServiceProviderConfiguration) (ServiceProvider, error) {
+					return nil, fmt.Errorf("fial")
+				},
+			},
+		}
+
+		f := Factory{
+			Initializers: NewInitializers().AddKnownInitializer(config.ServiceProviderTypeHostCredentials, mockInit),
+		}
+
+		repoUrl, _ := url.Parse("https://blabol.sp/hey/there")
+
+		sp, err := f.createHostCredentialsProvider(repoUrl)
+
+		assert.Nil(t, sp)
+		assert.Error(t, err)
+	})
+}
+
+func TestInitializeServiceProvider(t *testing.T) {
+	ctx := context.TODO()
+
+	mockSP := struct {
+		ServiceProvider
+	}{}
+
+	t.Run("initialize ok", func(t *testing.T) {
+		initializer := Initializer{
+			Constructor: struct {
+				ConstructorFunc
+			}{
+				ConstructorFunc: func(factory *Factory, spConfig *config.ServiceProviderConfiguration) (ServiceProvider, error) {
+					return mockSP, nil
+				},
+			}}
+
+		f := &Factory{
+			Initializers: NewInitializers().AddKnownInitializer(config.ServiceProviderTypeGitHub, initializer),
+		}
+
+		sp, err := f.initializeServiceProvider(ctx, config.ServiceProviderTypeGitHub, &config.ServiceProviderConfiguration{}, config.ServiceProviderTypeGitHub.DefaultBaseUrl)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, sp)
+	})
+
+	t.Run("error if no initializer", func(t *testing.T) {
+		f := &Factory{
+			Initializers: NewInitializers(),
+		}
+
+		sp, err := f.initializeServiceProvider(ctx, config.ServiceProviderTypeGitHub, &config.ServiceProviderConfiguration{}, config.ServiceProviderTypeGitHub.DefaultBaseUrl)
+
+		assert.Error(t, err)
+		assert.Nil(t, sp)
+	})
+
+	t.Run("error if no constructor", func(t *testing.T) {
+		f := &Factory{
+			Initializers: NewInitializers().AddKnownInitializer(config.ServiceProviderTypeGitHub, Initializer{}),
+		}
+
+		sp, err := f.initializeServiceProvider(ctx, config.ServiceProviderTypeGitHub, &config.ServiceProviderConfiguration{}, config.ServiceProviderTypeGitHub.DefaultBaseUrl)
+
+		assert.Error(t, err)
+		assert.Nil(t, sp)
+	})
+
+	t.Run("err if constructor fails", func(t *testing.T) {
+		initializer := Initializer{
+			Constructor: struct {
+				ConstructorFunc
+			}{
+				ConstructorFunc: func(factory *Factory, spConfig *config.ServiceProviderConfiguration) (ServiceProvider, error) {
+					return nil, fmt.Errorf("fail")
+				},
+			}}
+
+		f := &Factory{
+			Initializers: NewInitializers().AddKnownInitializer(config.ServiceProviderTypeGitHub, initializer),
+		}
+
+		sp, err := f.initializeServiceProvider(ctx, config.ServiceProviderTypeGitHub, &config.ServiceProviderConfiguration{}, config.ServiceProviderTypeGitHub.DefaultBaseUrl)
+
+		assert.Error(t, err)
+		assert.Nil(t, sp)
+	})
+
+	t.Run("spconf nil and no probe returns nil", func(t *testing.T) {
+		initializer := Initializer{
+			Constructor: struct {
+				ConstructorFunc
+			}{
+				ConstructorFunc: func(factory *Factory, spConfig *config.ServiceProviderConfiguration) (ServiceProvider, error) {
+					return mockSP, nil
+				},
+			},
+			Probe: nil,
+		}
+
+		f := &Factory{
+			Initializers: NewInitializers().AddKnownInitializer(config.ServiceProviderTypeGitHub, initializer),
+		}
+
+		sp, err := f.initializeServiceProvider(ctx, config.ServiceProviderTypeGitHub, nil, config.ServiceProviderTypeGitHub.DefaultBaseUrl)
+
+		assert.Nil(t, err)
+		assert.Nil(t, sp)
+	})
+
+	t.Run("if spconf nil, try probe", func(t *testing.T) {
+		initializer := Initializer{
+			Constructor: struct {
+				ConstructorFunc
+			}{
+				ConstructorFunc: func(factory *Factory, spConfig *config.ServiceProviderConfiguration) (ServiceProvider, error) {
+					return mockSP, nil
+				},
+			},
+			Probe: struct {
+				ProbeFunc
+			}{
+				ProbeFunc: func(cl *http.Client, url string) (string, error) {
+					return "https://base-url.com", nil
+				},
+			},
+		}
+
+		f := &Factory{
+			Initializers: NewInitializers().AddKnownInitializer(config.ServiceProviderTypeGitHub, initializer),
+		}
+
+		sp, err := f.initializeServiceProvider(ctx, config.ServiceProviderTypeGitHub, nil, config.ServiceProviderTypeGitHub.DefaultBaseUrl)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, sp)
+	})
+
+	t.Run("if spconf nil and probe fails, nil", func(t *testing.T) {
+		initializer := Initializer{
+			Constructor: struct {
+				ConstructorFunc
+			}{
+				ConstructorFunc: func(factory *Factory, spConfig *config.ServiceProviderConfiguration) (ServiceProvider, error) {
+					return mockSP, nil
+				},
+			},
+			Probe: struct {
+				ProbeFunc
+			}{
+				ProbeFunc: func(cl *http.Client, url string) (string, error) {
+					return "", fmt.Errorf("fail")
+				},
+			},
+		}
+
+		f := &Factory{
+			Initializers: NewInitializers().AddKnownInitializer(config.ServiceProviderTypeGitHub, initializer),
+		}
+
+		sp, err := f.initializeServiceProvider(ctx, config.ServiceProviderTypeGitHub, nil, config.ServiceProviderTypeGitHub.DefaultBaseUrl)
+
+		assert.NoError(t, err)
+		assert.Nil(t, sp)
+	})
+
+	t.Run("if spconf nil and probe return empty, nil", func(t *testing.T) {
+		initializer := Initializer{
+			Constructor: struct {
+				ConstructorFunc
+			}{
+				ConstructorFunc: func(factory *Factory, spConfig *config.ServiceProviderConfiguration) (ServiceProvider, error) {
+					return mockSP, nil
+				},
+			},
+			Probe: struct {
+				ProbeFunc
+			}{
+				ProbeFunc: func(cl *http.Client, url string) (string, error) {
+					return "", nil
+				},
+			},
+		}
+
+		f := &Factory{
+			Initializers: NewInitializers().AddKnownInitializer(config.ServiceProviderTypeGitHub, initializer),
+		}
+
+		sp, err := f.initializeServiceProvider(ctx, config.ServiceProviderTypeGitHub, nil, config.ServiceProviderTypeGitHub.DefaultBaseUrl)
+
+		assert.NoError(t, err)
+		assert.Nil(t, sp)
+	})
+
+	t.Run("if spconf nil, probe ok, construct fail returns error", func(t *testing.T) {
+		initializer := Initializer{
+			Constructor: struct {
+				ConstructorFunc
+			}{
+				ConstructorFunc: func(factory *Factory, spConfig *config.ServiceProviderConfiguration) (ServiceProvider, error) {
+					return nil, fmt.Errorf("fail")
+				},
+			},
+			Probe: struct {
+				ProbeFunc
+			}{
+				ProbeFunc: func(cl *http.Client, url string) (string, error) {
+					return "eh", nil
+				},
+			},
+		}
+
+		f := &Factory{
+			Initializers: NewInitializers().AddKnownInitializer(config.ServiceProviderTypeGitHub, initializer),
+		}
+
+		sp, err := f.initializeServiceProvider(ctx, config.ServiceProviderTypeGitHub, nil, config.ServiceProviderTypeGitHub.DefaultBaseUrl)
+
+		assert.Error(t, err)
+		assert.Nil(t, sp)
+	})
+}
+
+func TestSpConfigWithBaseUrl(t *testing.T) {
+	config.SetupCustomValidations(config.CustomValidationOptions{AllowInsecureURLs: true})
+	spConfig, err := spConfigWithBaseUrl(config.ServiceProviderTypeGitHub, "blabol")
+	assert.Nil(t, err)
+	assert.Equal(t, config.ServiceProviderTypeGitHub.Name, spConfig.ServiceProviderType.Name)
+	assert.Equal(t, "blabol", spConfig.ServiceProviderBaseUrl)
+	assert.Nil(t, spConfig.OAuth2Config)
+	assert.Empty(t, spConfig.Extra)
+}
+
+func TestSpConfigWithFilteredBaseUrl(t *testing.T) {
+	config.SetupCustomValidations(config.CustomValidationOptions{AllowInsecureURLs: false})
+	_, err := spConfigWithBaseUrl(config.ServiceProviderTypeGitHub, "blabol")
+	assert.NotNil(t, err)
+	var validationErr validator.ValidationErrors
+	assert.True(t, errors.As(err, &validationErr))
+	assert.NotNil(t, validationErr.Error())
 }

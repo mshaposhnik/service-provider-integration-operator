@@ -27,9 +27,9 @@ jobs:
       OPERATOR_SDK_VERSION: v1.12.0
     steps:
       - name: Set up Go 1.x
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v4
         with:
-          go-version: 1.18
+          go-version: "1.20"
       - name: Set up Python 3.8
         uses: actions/setup-python@v4
         with:
@@ -55,12 +55,6 @@ jobs:
           mkdir -p ~/bin
           cp ~/cache/operator-sdk-${OPERATOR_SDK_VERSION} ~/bin/operator-sdk
           echo "$HOME/bin" >> $GITHUB_PATH
-      - name: Install kcp tooling
-        run: |
-          git clone https://github.com/kcp-dev/kcp ~/kcp
-          cd ~/kcp
-          git checkout release-0.7
-          WHAT=./cmd/kubectl-kcp make install
       - name: Cache go modules
         id: cache-mod
         uses: actions/cache@v3
@@ -105,6 +99,11 @@ jobs:
             git --no-pager diff
             exit 1
           fi
+      - name: Start Minikube
+        run: |
+          curl -LO https://storage.googleapis.com/minikube/releases/v1.27.0/minikube-linux-amd64
+          sudo install minikube-linux-amd64 /usr/local/bin/minikube
+          minikube start --memory=4000mb
       - name: Run Go Tests
         env:
           GOMEGA_DEFAULT_EVENTUALLY_TIMEOUT: 10s
@@ -113,8 +112,8 @@ jobs:
           make test
       - name: Codecov
         uses: codecov/codecov-action@v3
-  docker:
-    name: Check docker build
+  docker-controller:
+    name: Check controller docker image build
     runs-on: ubuntu-latest
     steps:
       - name: Check out code into the Go module directory
@@ -123,3 +122,13 @@ jobs:
           fetch-depth: 0
       - name: Check if dockerimage build is working
         run: docker build -f ./Dockerfile .
+  docker-oauth:
+    name: Check oauth docker image build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Check if dockerimage build is working
+        run: docker build -f ./oauth.Dockerfile .

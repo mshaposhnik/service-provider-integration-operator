@@ -23,6 +23,7 @@ import (
 
 	opconfig "github.com/redhat-appstudio/service-provider-integration-operator/pkg/config"
 
+	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/config"
 	"github.com/redhat-appstudio/service-provider-integration-operator/pkg/spi-shared/tokenstorage"
 
 	"k8s.io/client-go/rest"
@@ -38,12 +39,14 @@ import (
 var _ serviceprovider.ServiceProvider = (*Quay)(nil)
 
 var (
-	userRelatedPermissionsNotSupportedError = errors.New("user-related permissions are not supported for Quay")
-	unsupportedScopeError                   = errors.New("unsupported scope")
-	unknownScopeError                       = errors.New("unknown scope")
-	failedToParseRepoUrlError               = errors.New("failed to parse repository URL")
-	unexpectedStatusCodeError               = errors.New("unexpected status code")
-	noResponseError                         = errors.New("no response")
+	unsupportedAreaError      = errors.New("unsupported permission area for Quay")
+	unsupportedScopeError     = errors.New("unsupported scope")
+	unknownScopeError         = errors.New("unknown scope")
+	failedToParseRepoUrlError = errors.New("failed to parse repository URL")
+	unexpectedStatusCodeError = errors.New("unexpected status code")
+	noResponseError           = errors.New("no response")
+
+	quayApiBaseUrl = config.ServiceProviderTypeQuay.DefaultBaseUrl + "/api/v1"
 )
 
 type Quay struct {
@@ -53,28 +56,37 @@ type Quay struct {
 	httpClient       rest.HTTPClient
 	tokenStorage     tokenstorage.TokenStorage
 	BaseUrl          string
+	OAuthCapability  serviceprovider.OAuthCapability
+}
+type quayOAuthCapability struct {
+	serviceprovider.DefaultOAuthCapability
 }
 
 var Initializer = serviceprovider.Initializer{
-	Probe:                        quayProbe{},
-	Constructor:                  serviceprovider.ConstructorFunc(newQuay),
-	SupportsManualUploadOnlyMode: true,
+	Probe:       quayProbe{},
+	Constructor: serviceprovider.ConstructorFunc(newQuay),
 }
 
-const quayUrlBase = "https://quay.io"
-const quayApiUrlBase = quayUrlBase + "/api/v1"
-
-func newQuay(factory *serviceprovider.Factory, _ string) (serviceprovider.ServiceProvider, error) {
-
+func newQuay(factory *serviceprovider.Factory, spConfig *config.ServiceProviderConfiguration) (serviceprovider.ServiceProvider, error) {
 	// in Quay, we invalidate the individual cached repository records, because we're filling up the cache repo-by-repo
 	// therefore the metadata as a whole never gets refreshed.
-	cache := serviceprovider.NewMetadataCache(factory.KubernetesClient, &serviceprovider.NeverMetadataExpirationPolicy{})
+	cache := factory.NewCacheWithExpirationPolicy(&serviceprovider.NeverMetadataExpirationPolicy{})
 	mp := &metadataProvider{
 		tokenStorage:     factory.TokenStorage,
 		httpClient:       factory.HttpClient,
 		kubernetesClient: factory.KubernetesClient,
 		ttl:              factory.Configuration.TokenLookupCacheTtl,
 	}
+
+	var oauthCapability serviceprovider.OAuthCapability
+	if spConfig != nil && spConfig.OAuth2Config != nil {
+		oauthCapability = &quayOAuthCapability{
+			DefaultOAuthCapability: serviceprovider.DefaultOAuthCapability{
+				BaseUrl: factory.Configuration.BaseUrl,
+			},
+		}
+	}
+
 	return &Quay{
 		Configuration: factory.Configuration,
 		lookup: serviceprovider.GenericLookup{
@@ -87,24 +99,33 @@ func newQuay(factory *serviceprovider.Factory, _ string) (serviceprovider.Servic
 		httpClient:       factory.HttpClient,
 		tokenStorage:     factory.TokenStorage,
 		metadataProvider: mp,
+		OAuthCapability:  oauthCapability,
 	}, nil
 }
 
 var _ serviceprovider.ConstructorFunc = newQuay
 
-func (g *Quay) GetOAuthEndpoint() string {
-	return g.Configuration.BaseUrl + "/quay/authenticate"
+func (q *Quay) GetBaseUrl() string {
+	return config.ServiceProviderTypeQuay.DefaultBaseUrl
 }
 
-func (g *Quay) GetBaseUrl() string {
-	return quayUrlBase
+func (q *Quay) GetType() config.ServiceProviderType {
+	return config.ServiceProviderTypeQuay
 }
 
-func (g *Quay) GetType() api.ServiceProviderType {
-	return api.ServiceProviderTypeQuay
+func (q *Quay) GetDownloadFileCapability() serviceprovider.DownloadFileCapability {
+	return nil
 }
 
-func (g *Quay) OAuthScopesFor(ps *api.Permissions) []string {
+func (q *Quay) GetRefreshTokenCapability() serviceprovider.RefreshTokenCapability {
+	return nil
+}
+
+func (q *Quay) GetOAuthCapability() serviceprovider.OAuthCapability {
+	return q.OAuthCapability
+}
+
+func (q *quayOAuthCapability) OAuthScopesFor(ps *api.Permissions) []string {
 	// This method is called when constructing the OAuth URL.
 	// We basically disregard any request for specific permissions and always require the max usable set of permissions
 	// because we cannot change that set later due to a bug in Quay OAuth impl:
@@ -131,7 +152,7 @@ func (g *Quay) OAuthScopesFor(ps *api.Permissions) []string {
 
 func translateToQuayScopes(permission api.Permission) []string {
 	switch permission.Area {
-	case api.PermissionAreaRepositoryMetadata:
+	case api.PermissionAreaRegistryMetadata:
 		switch permission.Type {
 		case api.PermissionTypeRead:
 			return []string{string(ScopeRepoRead)}
@@ -140,7 +161,7 @@ func translateToQuayScopes(permission api.Permission) []string {
 		case api.PermissionTypeReadWrite:
 			return []string{string(ScopeRepoRead), string(ScopeRepoWrite)}
 		}
-	case api.PermissionAreaRepository:
+	case api.PermissionAreaRegistry:
 		switch permission.Type {
 		case api.PermissionTypeRead:
 			return []string{string(ScopePull)}
@@ -149,35 +170,21 @@ func translateToQuayScopes(permission api.Permission) []string {
 		case api.PermissionTypeReadWrite:
 			return []string{string(ScopePull), string(ScopePush)}
 		}
-	case api.PermissionAreaUser:
-		switch permission.Type {
-		case api.PermissionTypeRead:
-			return []string{string(ScopeUserRead)}
-		case api.PermissionTypeWrite:
-			return []string{string(ScopeUserAdmin)}
-		case api.PermissionTypeReadWrite:
-			return []string{string(ScopeUserAdmin)}
-		}
 	}
 
 	return []string{}
 }
 
-func (g *Quay) LookupToken(ctx context.Context, cl client.Client, binding *api.SPIAccessTokenBinding) (*api.SPIAccessToken, error) {
-	tokens, err := g.lookup.Lookup(ctx, cl, binding)
+func (q *Quay) LookupTokens(ctx context.Context, cl client.Client, binding *api.SPIAccessTokenBinding) ([]api.SPIAccessToken, error) {
+	tokens, err := q.lookup.Lookup(ctx, cl, binding)
 	if err != nil {
 		return nil, fmt.Errorf("quay token lookup failure: %w", err)
 	}
-
-	if len(tokens) == 0 {
-		return nil, nil
-	}
-
-	return &tokens[0], nil
+	return tokens, nil
 }
 
-func (g *Quay) PersistMetadata(ctx context.Context, _ client.Client, token *api.SPIAccessToken) error {
-	if err := g.lookup.PersistMetadata(ctx, token); err != nil {
+func (q *Quay) PersistMetadata(ctx context.Context, _ client.Client, token *api.SPIAccessToken) error {
+	if err := q.lookup.PersistMetadata(ctx, token); err != nil {
 		return fmt.Errorf("failed to persiste quay metadata: %w", err)
 	}
 	return nil
@@ -195,7 +202,7 @@ func (q *Quay) CheckRepositoryAccess(ctx context.Context, cl client.Client, acce
 
 	owner, repository, _ := splitToOrganizationAndRepositoryAndVersion(accessCheck.Spec.RepoUrl)
 	if owner == "" || repository == "" {
-		lg.Error(failedToParseRepoUrlError, "we don't reconcile this resource again as we don't understand the URL '%s'. Error written to SPIAccessCheck status.", "repo url", accessCheck.Spec.RepoUrl)
+		lg.Error(failedToParseRepoUrlError, "we don't reconcile this resource again as we don't understand the URL. Error written to SPIAccessCheck status.", "repo url", accessCheck.Spec.RepoUrl)
 		status.ErrorReason = api.SPIAccessCheckErrorBadURL
 		status.ErrorMessage = failedToParseRepoUrlError.Error()
 		return status, nil // return nil error, because we don't want to reconcile this again
@@ -274,18 +281,28 @@ func (q *Quay) CheckRepositoryAccess(ctx context.Context, cl client.Client, acce
 }
 
 func (q *Quay) requestRepoInfo(ctx context.Context, owner, repository, token string) (int, map[string]interface{}, error) {
-	lg := log.FromContext(ctx)
+	requestUrl := fmt.Sprintf("%s/repository/%s/%s?includeTags=false", quayApiBaseUrl, owner, repository)
+	lg := log.FromContext(ctx, "repository", repository, "url", requestUrl)
 
-	requestUrl := fmt.Sprintf("%s/repository/%s/%s?includeTags=false", quayApiUrlBase, owner, repository)
-	if resp, err := doQuayRequest(ctx, q.httpClient, requestUrl, token, "GET", nil, ""); err != nil {
-		lg.Error(err, "failed to request quay.io api for repository info", "url", requestUrl)
+	resp, err := doQuayRequest(ctx, q.httpClient, requestUrl, token, "GET", nil, "")
+	if err != nil {
+		lg.Error(err, "failed to request quay.io api for repository info")
 		code := 0
 		if resp != nil {
 			code = resp.StatusCode
 		}
 		return code, nil, fmt.Errorf("failed to request quay on %s: %w", requestUrl, err)
-	} else if resp != nil && resp.StatusCode == http.StatusOK {
-		jsonResponse, jsonErr := readResponseBodyToJsonMap(resp)
+	}
+	if resp != nil && resp.Body != nil {
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				lg.Error(err, "failed to close response body")
+			}
+		}()
+	}
+
+	if resp != nil && resp.StatusCode == http.StatusOK {
+		jsonResponse, jsonErr := readResponseBodyToJsonMap(ctx, resp)
 		if jsonErr != nil {
 			return resp.StatusCode, nil, jsonErr
 		}
@@ -299,16 +316,20 @@ func (q *Quay) requestRepoInfo(ctx context.Context, owner, repository, token str
 	}
 }
 
-func (g *Quay) MapToken(ctx context.Context, binding *api.SPIAccessTokenBinding, token *api.SPIAccessToken, tokenData *api.Token) (serviceprovider.AccessTokenMapper, error) {
+func (q *Quay) MapToken(ctx context.Context, binding *api.SPIAccessTokenBinding, token *api.SPIAccessToken, tokenData *api.Token) (serviceprovider.AccessTokenMapper, error) {
 	lg := log.FromContext(ctx, "bindingName", binding.Name, "bindingNamespace", binding.Namespace)
 	lg.Info("mapping quay token")
 
 	mapper := serviceprovider.DefaultMapToken(token, tokenData)
 
-	repoMetadata, err := g.metadataProvider.FetchRepo(ctx, binding.Spec.RepoUrl, token)
+	repoMetadata, err := q.metadataProvider.FetchRepo(ctx, binding.Spec.RepoUrl, token)
 	if err != nil {
 		lg.Error(err, "failed to fetch repository metadata")
 		return serviceprovider.AccessTokenMapper{}, nil
+	}
+
+	if repoMetadata == nil {
+		return mapper, nil
 	}
 
 	allScopes := make([]Scope, 0, 2)
@@ -328,11 +349,13 @@ func (g *Quay) MapToken(ctx context.Context, binding *api.SPIAccessTokenBinding,
 func (q *Quay) Validate(ctx context.Context, validated serviceprovider.Validated) (serviceprovider.ValidationResult, error) {
 	ret := serviceprovider.ValidationResult{}
 
-	userPermissionAreaRequested := false
 	for _, p := range validated.Permissions().Required {
-		if p.Area == api.PermissionAreaUser && !userPermissionAreaRequested {
-			ret.ScopeValidation = append(ret.ScopeValidation, userRelatedPermissionsNotSupportedError)
-			userPermissionAreaRequested = true
+		switch p.Area {
+		case api.PermissionAreaRegistry,
+			api.PermissionAreaRegistryMetadata:
+			continue
+		default:
+			ret.ScopeValidation = append(ret.ScopeValidation, fmt.Errorf("%w: '%s'", unsupportedAreaError, p.Area))
 		}
 	}
 
@@ -356,8 +379,8 @@ type quayProbe struct{}
 var _ serviceprovider.Probe = (*quayProbe)(nil)
 
 func (q quayProbe) Examine(_ *http.Client, url string) (string, error) {
-	if strings.HasPrefix(url, quayUrlBase) || strings.HasPrefix(url, "quay.io") {
-		return quayUrlBase, nil
+	if strings.HasPrefix(url, config.ServiceProviderTypeQuay.DefaultBaseUrl) || strings.HasPrefix(url, config.ServiceProviderTypeQuay.DefaultHost) {
+		return config.ServiceProviderTypeQuay.DefaultBaseUrl, nil
 	} else {
 		return "", nil
 	}
