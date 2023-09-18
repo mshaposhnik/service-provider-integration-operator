@@ -18,8 +18,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
-	"strings"
-
+	"github.com/redhat-appstudio/remote-secret/pkg/commaseparated"
 	"k8s.io/utils/strings/slices"
 
 	appstudiov1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
@@ -39,7 +38,7 @@ import (
 
 const (
 	ApplicationLabelName                   = "appstudio.redhat.com/application"
-	EnvironmentLabelName                   = "appstudio.redhat.com/environment"
+	EnvironmentAnnotationName              = "appstudio.redhat.com/environment"
 	ComponentLabelName                     = "appstudio.redhat.com/component"
 	linkedRemoteSecretsTargetFinalizerName = "spi.appstudio.redhat.com/remote-secrets" //#nosec G101 -- false positive, just label name
 )
@@ -184,18 +183,8 @@ func detectTargetFromEnvironment(ctx context.Context, environment appstudiov1alp
 }
 
 func remoteSecretApplicableForEnvironment(remoteSecret rapi.RemoteSecret, environmentName string) bool {
-	var targetEnvironments []string
-	if environmentLabelInSecret, labelSet := remoteSecret.Labels[EnvironmentLabelName]; labelSet {
-		return environmentName == environmentLabelInSecret
-	} else if environmentAnnotationsInSecret, annotationSet := remoteSecret.Annotations[EnvironmentLabelName]; annotationSet {
-		envs := strings.Split(environmentAnnotationsInSecret, ",")
-		for i := range envs {
-			envs[i] = strings.TrimSpace(envs[i])
-		}
-		targetEnvironments = envs
-	}
-	if len(targetEnvironments) > 0 && !slices.Contains(targetEnvironments, environmentName) {
-		return false
+	if annotationValue, isSet := remoteSecret.Annotations[EnvironmentAnnotationName]; isSet {
+		return slices.Contains(commaseparated.Value(annotationValue).Values(), environmentName)
 	}
 	return true
 }
