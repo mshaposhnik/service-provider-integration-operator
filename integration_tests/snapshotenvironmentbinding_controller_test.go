@@ -34,7 +34,7 @@ var _ = Describe("SnapshotEnvironmentBinding", func() {
 			Behavior: ITestBehavior{},
 		}
 
-		When("remote secret has environment annotations", func() {
+		When("RemoteSecret has the environment label", func() {
 
 			BeforeEach(func() {
 				testSetup.BeforeEach(nil)
@@ -44,7 +44,52 @@ var _ = Describe("SnapshotEnvironmentBinding", func() {
 				testSetup.AfterEach()
 			})
 
-			It("have the target set", func() {
+			It("sets the target", func() {
+				rs := &rapi.RemoteSecret{
+					ObjectMeta: metav1.ObjectMeta{
+						GenerateName: "create-target-remotesecret-",
+						Namespace:    env.Namespace,
+						Labels:       map[string]string{"appstudio.redhat.com/application": "test-app", "appstudio.redhat.com/environment": env.Name},
+					},
+					Spec: rapi.RemoteSecretSpec{
+						Secret: rapi.LinkableSecretSpec{
+							Name: "test-remote-secret",
+							Type: "Opaque",
+						},
+					},
+				}
+				Expect(ITest.Client.Create(ITest.Context, rs)).To(Succeed())
+				// SEB must always be created after RS
+				seb := &v1alpha1.SnapshotEnvironmentBinding{
+					ObjectMeta: metav1.ObjectMeta{
+						GenerateName: "create-target-snapshotbinding-",
+						Namespace:    env.Namespace,
+						Labels:       map[string]string{"appstudio.redhat.com/application": "test-app", "appstudio.redhat.com/environment": env.Name},
+					},
+					Spec: v1alpha1.SnapshotEnvironmentBindingSpec{
+						Application: "test-app",
+						Environment: env.Name,
+						Components:  []v1alpha1.BindingComponent{},
+					},
+				}
+				Expect(ITest.Client.Create(ITest.Context, seb)).To(Succeed())
+				testSetup.ReconcileWithCluster(func(g Gomega) {
+					g.Expect(testSetup.InCluster.RemoteSecrets[0].Spec.Targets[0].Namespace).To(Equal(env.Namespace))
+				})
+			})
+		})
+
+		When("RemoteSecrets has the environment annotations", func() {
+
+			BeforeEach(func() {
+				testSetup.BeforeEach(nil)
+			})
+
+			var _ = AfterEach(func() {
+				testSetup.AfterEach()
+			})
+
+			It("sets the target", func() {
 				rs := &rapi.RemoteSecret{
 					ObjectMeta: metav1.ObjectMeta{
 						GenerateName: "create-target-remotesecret-",
